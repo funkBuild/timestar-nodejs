@@ -1,14 +1,15 @@
 {
   "name": "timestar",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Node.js client for the TimeStar time series database using protobuf binary protocol with native compression",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist",
     "proto",
-    "native",
-    "build/Release/timestar_compression.node"
+    "native/CMakeLists.txt",
+    "native/src",
+    "native/include"
   ],
   "scripts": {
     "install": "cmake-js compile -d native",

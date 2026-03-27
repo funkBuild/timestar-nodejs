@@ -1,0 +1,48 @@
+{
+  "name": "timestar",
+  "version": "0.1.0",
+  "description": "Node.js client for the TimeStar time series database using protobuf binary protocol with native compression",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "proto",
+    "native",
+    "build/Release/timestar_compression.node"
+  ],
+  "scripts": {
+    "install": "cmake-js compile -d native",
+    "build:native": "cmake-js compile -d native",
+    "build:ts": "tsc",
+    "build": "npm run build:native && npm run build:ts",
+    "rebuild": "cmake-js rebuild -d native",
+    "prepublishOnly": "npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "npx tsx benchmark/bench.ts",
+    "bench:compare": "npx tsx benchmark/compare.ts",
+    "bench:no-compress": "npx tsx benchmark/bench.ts --no-compress"
+  },
+  "keywords": [
+    "timestar",
+    "timeseries",
+    "database",
+    "protobuf",
+    "tsdb",
+    "compression"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cmake-js": "^7.3.0",
+    "node-addon-api": "^8.3.0",
+    "protobufjs": "^7.4.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

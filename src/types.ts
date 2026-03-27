@@ -2,6 +2,7 @@
 // Write API
 // ============================================================================
 
+/** Explicit typed field — use when auto-detection isn't sufficient (e.g., forcing int64 for whole numbers). */
 export interface WriteField {
   doubleValues?: number[];
   boolValues?: boolean[];
@@ -9,10 +10,21 @@ export interface WriteField {
   int64Values?: Array<number | bigint>;
 }
 
+/** A field value: scalar, typed array, or plain array (auto-detected). */
+export type FieldValue =
+  | number                        // single double
+  | boolean                       // single bool
+  | string                        // single string
+  | bigint                        // single int64
+  | number[]                      // auto-detected as double[]
+  | boolean[]                     // auto-detected as bool[]
+  | string[]                      // auto-detected as string[]
+  | WriteField;                   // explicit typed field
+
 export interface WritePoint {
   measurement: string;
   tags?: Record<string, string>;
-  fields: Record<string, WriteField | number | boolean | string | bigint>;
+  fields: Record<string, FieldValue>;
   timestamps: Array<number | bigint>;
 }
 

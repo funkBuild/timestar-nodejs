@@ -48,26 +48,59 @@ const client = new TimestarClient({
 ### Write Points
 
 ```ts
+// Array fields — type auto-detected from contents
 await client.write({
   measurement: "cpu",
   tags: { host: "server-01", region: "us-east" },
   fields: {
-    usage: { doubleValues: [55.2, 62.8, 49.1] },
-    throttled: { boolValues: [false, false, true] },
+    usage: [55.2, 62.8, 49.1],
+    throttled: [false, false, true],
   },
   timestamps: [1700000000000, 1700000001000, 1700000002000],
 });
-```
 
-Single scalar values are also accepted as a shorthand:
-
-```ts
+// Single scalar shorthand
 await client.write({
   measurement: "cpu",
   tags: { host: "server-01" },
   fields: { usage: 55.2 },
   timestamps: [1700000000000],
 });
+
+// Explicit type when needed (e.g., force int64 for whole numbers)
+await client.write({
+  measurement: "counters",
+  tags: { host: "server-01" },
+  fields: { requests: { int64Values: [1000, 2000, 3000] } },
+  timestamps: [1700000000000, 1700000001000, 1700000002000],
+});
+```
+
+### Field Type Detection
+
+Field values are auto-detected from their contents:
+
+| Value | Detected type | Example |
+|---|---|---|
+| `number` | double (scalar) | `{ usage: 55.2 }` |
+| `boolean` | bool (scalar) | `{ active: true }` |
+| `string` | string (scalar) | `{ name: "sensor-1" }` |
+| `bigint` | int64 (scalar) | `{ count: 42n }` |
+| `number[]` | double array | `{ usage: [55.2, 62.8] }` |
+| `boolean[]` | bool array | `{ active: [true, false] }` |
+| `string[]` | string array | `{ tags: ["a", "b"] }` |
+
+To override auto-detection, wrap in a `WriteField` object with the explicit type key:
+
+```ts
+// Whole numbers auto-detect as double — use int64Values to force integer storage
+{ requests: { int64Values: [1000, 2000, 3000] } }
+
+// All four explicit types:
+{ temperature: { doubleValues: [22.5, 23.1] } }
+{ active:      { boolValues: [true, false] } }
+{ label:       { stringValues: ["a", "b"] } }
+{ count:       { int64Values: [100n, 200n] } }
 ```
 
 ### Query

@@ -17,6 +17,7 @@ export type {
   TimestarClientOptions,
 
   // Write
+  FieldValue,
   WriteField,
   WritePoint,
   WriteRequest,

@@ -575,31 +575,65 @@ export class TimestarError extends Error {
 // Conversion helpers
 // =============================================================================
 
+// Detect field type from a plain array by inspecting the first element.
+function normalizeFieldValue(val: unknown): ProtoWriteField | null {
+  // Single scalars — skip compression
+  if (typeof val === "number") return { doubleValues: { values: [val] } };
+  if (typeof val === "boolean") return { boolValues: { values: [val] } };
+  if (typeof val === "string") return { stringValues: { values: [val] } };
+  if (typeof val === "bigint") return { int64Values: { values: [Number(val)] } };
+
+  // Plain array — auto-detect type from first element
+  if (Array.isArray(val) && val.length > 0) {
+    const first = val[0];
+    if (typeof first === "number") {
+      const nums = val as number[];
+      return { doubleValues: { values: nums, compressedAlp: compressDoubles(nums) } };
+    }
+    if (typeof first === "boolean") {
+      const bools = val as boolean[];
+      return { boolValues: { values: bools, compressedRle: compressBooleans(bools) } };
+    }
+    if (typeof first === "string") {
+      const strs = val as string[];
+      return { stringValues: { values: strs, compressedZstd: compressStrings(strs), count: strs.length } };
+    }
+    if (typeof first === "bigint") {
+      const ints = (val as bigint[]).map(Number);
+      return { int64Values: { values: ints, compressedFfor: compressIntegers(ints) } };
+    }
+  }
+
+  // Empty array — return empty doubles by default
+  if (Array.isArray(val) && val.length === 0) {
+    return { doubleValues: { values: [] } };
+  }
+
+  // Explicit WriteField — pass through with compression
+  const wf = val as WriteField;
+  if (wf.doubleValues) {
+    return { doubleValues: { values: wf.doubleValues, compressedAlp: compressDoubles(wf.doubleValues) } };
+  }
+  if (wf.boolValues) {
+    return { boolValues: { values: wf.boolValues, compressedRle: compressBooleans(wf.boolValues) } };
+  }
+  if (wf.stringValues) {
+    return { stringValues: { values: wf.stringValues, compressedZstd: compressStrings(wf.stringValues), count: wf.stringValues.length } };
+  }
+  if (wf.int64Values) {
+    const nums = wf.int64Values.map(Number);
+    return { int64Values: { values: nums, compressedFfor: compressIntegers(nums) } };
+  }
+
+  return null;
+}
+
 function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
   const protoFields: Record<string, ProtoWriteField> = {};
 
   for (const [key, val] of Object.entries(point.fields)) {
-    if (typeof val === "number") {
-      // [M10 fix] Single scalars: skip compression (overhead > savings)
-      protoFields[key] = { doubleValues: { values: [val] } };
-    } else if (typeof val === "boolean") {
-      protoFields[key] = { boolValues: { values: [val] } };
-    } else if (typeof val === "string") {
-      protoFields[key] = { stringValues: { values: [val] } };
-    } else if (typeof val === "bigint") {
-      protoFields[key] = { int64Values: { values: [Number(val)] } };
-    } else {
-      const wf = val as WriteField;
-      if (wf.doubleValues) {
-        protoFields[key] = { doubleValues: { values: wf.doubleValues, compressedAlp: compressDoubles(wf.doubleValues) } };
-      } else if (wf.boolValues) {
-        protoFields[key] = { boolValues: { values: wf.boolValues, compressedRle: compressBooleans(wf.boolValues) } };
-      } else if (wf.stringValues) {
-        protoFields[key] = { stringValues: { values: wf.stringValues, compressedZstd: compressStrings(wf.stringValues), count: wf.stringValues.length } };
-      } else if (wf.int64Values) {
-        protoFields[key] = { int64Values: { values: wf.int64Values.map(Number), compressedFfor: compressIntegers(wf.int64Values.map(Number)) } };
-      }
-    }
+    const field = normalizeFieldValue(val);
+    if (field) protoFields[key] = field;
   }
 
   return {

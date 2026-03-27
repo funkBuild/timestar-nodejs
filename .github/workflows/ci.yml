@@ -37,17 +37,6 @@ jobs:
   integration-test:
     runs-on: ubuntu-24.04
 
-    services:
-      timestar:
-        image: funkbuild/timestar:latest
-        ports:
-          - 8086:8086
-        options: >-
-          --health-cmd "curl -sf http://localhost:8086/health || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
     steps:
       - uses: actions/checkout@v4
 
@@ -66,8 +55,34 @@ jobs:
       - name: Build TypeScript
         run: npm run build:ts
 
+      - name: Start TimeStar container
+        run: |
+          docker run -d --name timestar \
+            -p 8086:8086 \
+            -e TIMESTAR_OVERPROVISIONED=true \
+            funkbuild/timestar:latest \
+            --smp 1 --memory 512M
+
+      - name: Wait for TimeStar to be healthy
+        run: |
+          echo "Waiting for TimeStar..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8086/health > /dev/null 2>&1; then
+              echo "TimeStar is healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "TimeStar failed to start"
+          docker logs timestar
+          exit 1
+
       - name: Run integration tests
         run: npm test
         env:
           TIMESTAR_HOST: localhost
           TIMESTAR_PORT: 8086
+
+      - name: TimeStar logs (on failure)
+        if: failure()
+        run: docker logs timestar

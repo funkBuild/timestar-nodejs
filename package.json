@@ -1,6 +1,6 @@
 {
   "name": "timestar",
-  "version": "1.0.1",
+  "version": "1.0.0",
   "description": "Node.js client for the TimeStar time series database using protobuf binary protocol with native compression",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

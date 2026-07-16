@@ -1,5 +1,15 @@
 import * as http from "http";
-import { codecs, init as protoInit, ProtoFieldData, ProtoQueryResponse, ProtoWriteField, ProtoWritePoint } from "./proto";
+import {
+  codecs,
+  init as protoInit,
+  ProtoAnomalyResponse,
+  ProtoDerivedQueryResponse,
+  ProtoFieldData,
+  ProtoForecastResponse,
+  ProtoQueryResponse,
+  ProtoWriteField,
+  ProtoWritePoint,
+} from "./proto";
 import {
   compressTimestamps,
   decompressTimestamps,
@@ -38,7 +48,9 @@ import type {
   DerivedQueryOptions,
   DerivedQueryResponse,
   AnomalyResponse,
+  AnomalySeriesPiece,
   ForecastResponse,
+  ForecastSeriesPiece,
   HealthResponse,
 } from "./types";
 
@@ -99,6 +111,70 @@ export class TimestarClient {
     }
   }
 
+  // Throw a TimestarError extracted from an error response body.
+  //
+  // Server >= 1.0.7 tags protobuf responses with Content-Type
+  // "application/x-protobuf" (older servers used "application/json" even for
+  // protobuf bodies), and all JSON errors are the flat shape
+  //   {"status":"error","error_code":"<CODE>","message":"<msg>","error":"<msg>"}
+  // (error_code omitted when uncoded). Older servers used a NESTED shape
+  // {"error":{"code","message"}} on metadata/cardinality/derived and a bare
+  // {"message"} on the write handler — all are still tolerated here.
+  //
+  // `resCodecKey` selects the protobuf message the server encodes errors in
+  // for this endpoint: /write errors arrive as WriteResponse (errors[]),
+  // /query as QueryResponse (error_code/error_message), /derived as
+  // DerivedQueryResponse; everything else uses StatusResponse.
+  private async throwServerError(
+    res: { status: number; headers: Record<string, string>; body: Buffer },
+    resCodecKey?: keyof typeof codecs,
+  ): Promise<never> {
+    const contentType = (res.headers["content-type"] ?? "").toLowerCase();
+    const bodyText = res.body.toString("utf-8");
+
+    // JSON error body (flat >= 1.0.7, nested/bare-message for older servers)
+    if (contentType.includes("json") || bodyText.trimStart().startsWith("{")) {
+      try {
+        const j = JSON.parse(bodyText);
+        let message: string | undefined;
+        let code: string | undefined = typeof j.error_code === "string" ? j.error_code : undefined;
+        if (typeof j.error === "string") {
+          message = j.error;
+        } else if (j.error && typeof j.error === "object") {
+          // Legacy nested {"error":{"code","message"}}
+          message = typeof j.error.message === "string" ? j.error.message : undefined;
+          if (!code && typeof j.error.code === "string") code = j.error.code;
+        }
+        if (!message && typeof j.message === "string") message = j.message;
+        throw new TimestarError(message ?? bodyText, res.status, code);
+      } catch (e) {
+        if (e instanceof TimestarError) throw e;
+        throw new TimestarError(bodyText, res.status);
+      }
+    }
+
+    // Protobuf error body — decode with the endpoint's response message first
+    try {
+      if (resCodecKey === "WriteResponse") {
+        const wr = await codecs.WriteResponse.decode(new Uint8Array(res.body));
+        throw new TimestarError(wr.errors?.join("; ") || wr.status || bodyText, res.status);
+      }
+      if (resCodecKey === "QueryResponse") {
+        const qr = await codecs.QueryResponse.decode(new Uint8Array(res.body));
+        throw new TimestarError(qr.errorMessage || qr.status || bodyText, res.status, qr.errorCode || undefined);
+      }
+      if (resCodecKey === "DerivedQueryResponse") {
+        const dr = await codecs.DerivedQueryResponse.decode(new Uint8Array(res.body));
+        throw new TimestarError(dr.errorMessage || dr.status || bodyText, res.status, dr.errorCode || undefined);
+      }
+      const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
+      throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code || undefined);
+    } catch (e) {
+      if (e instanceof TimestarError) throw e;
+      throw new TimestarError(bodyText, res.status);
+    }
+  }
+
   private async protoPost<TReq, TRes>(
     path: string,
     reqCodecKey: keyof typeof codecs,
@@ -118,14 +194,7 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      // Try to decode error as protobuf StatusResponse, fall back to text
-      try {
-        const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
-        throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code);
-      } catch (e) {
-        if (e instanceof TimestarError) throw e;
-        throw new TimestarError(res.body.toString("utf-8"), res.status);
-      }
+      await this.throwServerError(res, resCodecKey);
     }
     return resCodec.decode(new Uint8Array(res.body));
   }
@@ -153,13 +222,7 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      try {
-        const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
-        throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code);
-      } catch (e) {
-        if (e instanceof TimestarError) throw e;
-        throw new TimestarError(res.body.toString("utf-8"), res.status);
-      }
+      await this.throwServerError(res);
     }
     return resCodec.decode(new Uint8Array(res.body));
   }
@@ -218,13 +281,7 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      try {
-        const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
-        throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code);
-      } catch (e) {
-        if (e instanceof TimestarError) throw e;
-        throw new TimestarError(res.body.toString("utf-8"), res.status);
-      }
+      await this.throwServerError(res, "QueryResponse");
     }
     const proto = await codecs.QueryResponse.decode(new Uint8Array(res.body));
     return convertQueryResponse(proto);
@@ -334,7 +391,7 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      throw new TimestarError(res.body.toString("utf-8"), res.status);
+      await this.throwServerError(res);
     }
   }
 
@@ -346,6 +403,9 @@ export class TimestarClient {
     );
   }
 
+  // Note: server >= 1.0.7 returns a valid JSON body with a proper "message"
+  // for DELETE /retention (earlier builds emitted corrupted bytes). The body
+  // is intentionally not parsed on success, so no workaround was ever needed.
   async deleteRetention(measurement: string): Promise<void> {
     { const p = this.ensureInit(); if (p) await p; }
     const url = new URL("/retention", this.baseUrl);
@@ -353,7 +413,7 @@ export class TimestarClient {
 
     const res = await this.request("DELETE", url.pathname + url.search);
     if (res.status >= 400) {
-      throw new TimestarError(res.body.toString("utf-8"), res.status);
+      await this.throwServerError(res);
     }
   }
 
@@ -462,12 +522,13 @@ export class TimestarClient {
       payload.aggregationInterval = options.aggregationInterval;
     }
 
-    return this.protoPost<any, DerivedQueryResponse>(
+    const proto = await this.protoPost<any, ProtoDerivedQueryResponse>(
       "/derived",
       "DerivedQueryRequest",
       "DerivedQueryResponse",
       payload,
     );
+    return convertDerivedQueryResponse(proto);
   }
 
   // ---------------------------------------------------------------------------
@@ -502,15 +563,10 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      try {
-        const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
-        throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code);
-      } catch (e) {
-        if (e instanceof TimestarError) throw e;
-        throw new TimestarError(res.body.toString("utf-8"), res.status);
-      }
+      await this.throwServerError(res, "DerivedQueryResponse");
     }
-    return codecs.AnomalyResponse.decode(new Uint8Array(res.body)) as unknown as AnomalyResponse;
+    const proto = await codecs.AnomalyResponse.decode(new Uint8Array(res.body));
+    return convertAnomalyResponse(proto);
   }
 
   // ---------------------------------------------------------------------------
@@ -544,15 +600,10 @@ export class TimestarClient {
       "application/protobuf",
     );
     if (res.status >= 400) {
-      try {
-        const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
-        throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code);
-      } catch (e) {
-        if (e instanceof TimestarError) throw e;
-        throw new TimestarError(res.body.toString("utf-8"), res.status);
-      }
+      await this.throwServerError(res, "DerivedQueryResponse");
     }
-    return codecs.ForecastResponse.decode(new Uint8Array(res.body)) as unknown as ForecastResponse;
+    const proto = await codecs.ForecastResponse.decode(new Uint8Array(res.body));
+    return convertForecastResponse(proto);
   }
 }
 
@@ -575,8 +626,21 @@ export class TimestarError extends Error {
 // Conversion helpers
 // =============================================================================
 
+// Wire strategy (server >= 1.0.7): compressed payloads are sent INSTEAD of the
+// raw repeated arrays. The server prefers the compressed_* bytes when present
+// and decodes them natively (FFOR timestamps, ALP doubles, zigzag+FFOR int64,
+// RLE bools, zstd strings). Servers older than 1.0.7 IGNORED the compressed
+// fields entirely, so compressed-only writes would be silently dropped there —
+// this client therefore requires server >= 1.0.7.
+//
+// Compression is used when the value array length matches the timestamp count
+// (>= 2 values). Mismatched lengths are sent raw so the server's validation
+// and single-timestamp replication semantics stay unchanged.
+const shouldCompress = (len: number, tsCount: number): boolean => len >= 2 && len === tsCount;
+
 // Detect field type from a plain array by inspecting the first element.
-function normalizeFieldValue(val: unknown): ProtoWriteField | null {
+// `tsCount` is the number of timestamps on the enclosing write point.
+function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | null {
   // Single scalars — skip compression
   if (typeof val === "number") return { doubleValues: { values: [val] } };
   if (typeof val === "boolean") return { boolValues: { values: [val] } };
@@ -588,19 +652,27 @@ function normalizeFieldValue(val: unknown): ProtoWriteField | null {
     const first = val[0];
     if (typeof first === "number") {
       const nums = val as number[];
-      return { doubleValues: { values: nums, compressedAlp: compressDoubles(nums) } };
+      return shouldCompress(nums.length, tsCount)
+        ? { doubleValues: { compressedAlp: compressDoubles(nums) } }
+        : { doubleValues: { values: nums } };
     }
     if (typeof first === "boolean") {
       const bools = val as boolean[];
-      return { boolValues: { values: bools, compressedRle: compressBooleans(bools) } };
+      return shouldCompress(bools.length, tsCount)
+        ? { boolValues: { compressedRle: compressBooleans(bools) } }
+        : { boolValues: { values: bools } };
     }
     if (typeof first === "string") {
       const strs = val as string[];
-      return { stringValues: { values: strs, compressedZstd: compressStrings(strs), count: strs.length } };
+      return shouldCompress(strs.length, tsCount)
+        ? { stringValues: { compressedZstd: compressStrings(strs), count: strs.length } }
+        : { stringValues: { values: strs } };
     }
     if (typeof first === "bigint") {
       const ints = (val as bigint[]).map(Number);
-      return { int64Values: { values: ints, compressedFfor: compressIntegers(ints) } };
+      return shouldCompress(ints.length, tsCount)
+        ? { int64Values: { compressedFfor: compressIntegers(ints) } }
+        : { int64Values: { values: ints } };
     }
   }
 
@@ -612,37 +684,53 @@ function normalizeFieldValue(val: unknown): ProtoWriteField | null {
   // Explicit WriteField — pass through with compression
   const wf = val as WriteField;
   if (wf.doubleValues) {
-    return { doubleValues: { values: wf.doubleValues, compressedAlp: compressDoubles(wf.doubleValues) } };
+    return shouldCompress(wf.doubleValues.length, tsCount)
+      ? { doubleValues: { compressedAlp: compressDoubles(wf.doubleValues) } }
+      : { doubleValues: { values: wf.doubleValues } };
   }
   if (wf.boolValues) {
-    return { boolValues: { values: wf.boolValues, compressedRle: compressBooleans(wf.boolValues) } };
+    return shouldCompress(wf.boolValues.length, tsCount)
+      ? { boolValues: { compressedRle: compressBooleans(wf.boolValues) } }
+      : { boolValues: { values: wf.boolValues } };
   }
   if (wf.stringValues) {
-    return { stringValues: { values: wf.stringValues, compressedZstd: compressStrings(wf.stringValues), count: wf.stringValues.length } };
+    return shouldCompress(wf.stringValues.length, tsCount)
+      ? { stringValues: { compressedZstd: compressStrings(wf.stringValues), count: wf.stringValues.length } }
+      : { stringValues: { values: wf.stringValues } };
   }
   if (wf.int64Values) {
     const nums = wf.int64Values.map(Number);
-    return { int64Values: { values: nums, compressedFfor: compressIntegers(nums) } };
+    return shouldCompress(nums.length, tsCount)
+      ? { int64Values: { compressedFfor: compressIntegers(nums) } }
+      : { int64Values: { values: nums } };
   }
 
   return null;
 }
 
 function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
+  const tsCount = point.timestamps.length;
   const protoFields: Record<string, ProtoWriteField> = {};
 
   for (const [key, val] of Object.entries(point.fields)) {
-    const field = normalizeFieldValue(val);
+    const field = normalizeFieldValue(val, tsCount);
     if (field) protoFields[key] = field;
   }
 
-  return {
+  const base: ProtoWritePoint = {
     measurement: point.measurement,
     tags: point.tags ?? {},
     fields: protoFields,
-    timestamps: point.timestamps.map(Number),
-    compressedTimestamps: compressTimestamps(point.timestamps),
   };
+
+  // Compressed timestamps replace the raw repeated field (server >= 1.0.7
+  // prefers the compressed bytes; a single timestamp is smaller raw).
+  if (tsCount >= 2) {
+    base.compressedTimestamps = compressTimestamps(point.timestamps);
+  } else {
+    base.timestamps = point.timestamps.map(Number);
+  }
+  return base;
 }
 
 function normalizeDeleteRequest(item: DeleteRequestItem): any {
@@ -779,6 +867,73 @@ function convertQueryResponse(proto: ProtoQueryResponse): QueryResponse {
       truncationReason: "",
     },
     errorCode: proto.errorCode || undefined,
+    errorMessage: proto.errorMessage || undefined,
+  };
+}
+
+// Decompress a FFOR-compressed times array (count derived from block headers).
+function decompressTimesField(compressed: Uint8Array | undefined, raw: number[] | undefined): number[] {
+  if (compressed && compressed.length > 0) {
+    const count = readFforTotalCount(compressed);
+    return decompressTimestamps(toBuffer(compressed), count);
+  }
+  return raw ?? [];
+}
+
+// Decompress an ALP-compressed values array (self-describing).
+function decompressValuesField(compressed: Uint8Array | undefined, raw: number[] | undefined): number[] {
+  if (compressed && compressed.length > 0) {
+    return decompressDoubles(toBuffer(compressed));
+  }
+  return raw ?? [];
+}
+
+// The server compresses /derived response arrays for protobuf clients
+// (FFOR timestamps, ALP values) — decompress to plain arrays for users.
+function convertDerivedQueryResponse(proto: ProtoDerivedQueryResponse): DerivedQueryResponse {
+  return {
+    status: proto.status,
+    timestamps: decompressTimesField(proto.compressedTimestamps, proto.timestamps),
+    values: decompressValuesField(proto.compressedValues, proto.values),
+    formula: proto.formula,
+    statistics: proto.statistics ?? {
+      pointCount: 0,
+      executionTimeMs: 0,
+      subQueriesExecuted: 0,
+      pointsDroppedDueToAlignment: 0,
+    },
+    errorCode: proto.errorCode || undefined,
+    errorMessage: proto.errorMessage || undefined,
+  };
+}
+
+function convertAnomalyResponse(proto: ProtoAnomalyResponse): AnomalyResponse {
+  return {
+    status: proto.status,
+    times: decompressTimesField(proto.compressedTimes, proto.times),
+    series: (proto.series ?? []).map((p) => ({
+      piece: p.piece as AnomalySeriesPiece["piece"],
+      groupTags: p.groupTags ?? [],
+      values: decompressValuesField(p.compressedValues, p.values),
+      alertValue: p.hasAlert ? p.alertValue : undefined,
+      hasAlert: p.hasAlert,
+    })),
+    statistics: proto.statistics,
+    errorMessage: proto.errorMessage || undefined,
+  };
+}
+
+function convertForecastResponse(proto: ProtoForecastResponse): ForecastResponse {
+  return {
+    status: proto.status,
+    times: decompressTimesField(proto.compressedTimes, proto.times),
+    forecastStartIndex: proto.forecastStartIndex,
+    series: (proto.series ?? []).map((p) => ({
+      piece: p.piece as ForecastSeriesPiece["piece"],
+      groupTags: p.groupTags ?? [],
+      values: decompressValuesField(p.compressedValues, p.values),
+    })),
+    statistics: proto.statistics,
     errorMessage: proto.errorMessage || undefined,
   };
 }

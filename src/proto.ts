@@ -284,15 +284,19 @@ export interface ProtoDerivedQueryResponse {
   };
   errorCode: string;
   errorMessage: string;
+  compressedTimestamps?: Uint8Array;  // FFOR compressed (server sends these to protobuf clients)
+  compressedValues?: Uint8Array;      // ALP compressed
 }
 
 export interface ProtoAnomalyResponse {
   status: string;
   times: number[];
+  compressedTimes?: Uint8Array;  // FFOR compressed
   series: Array<{
     piece: string;
     groupTags: string[];
     values: number[];
+    compressedValues?: Uint8Array;  // ALP compressed
     alertValue: number;
     hasAlert: boolean;
   }>;
@@ -310,11 +314,13 @@ export interface ProtoAnomalyResponse {
 export interface ProtoForecastResponse {
   status: string;
   times: number[];
+  compressedTimes?: Uint8Array;  // FFOR compressed
   forecastStartIndex: number;
   series: Array<{
     piece: string;
     groupTags: string[];
     values: number[];
+    compressedValues?: Uint8Array;  // ALP compressed
   }>;
   statistics: {
     algorithm: string;

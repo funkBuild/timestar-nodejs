@@ -15,6 +15,30 @@ Communicates over a protobuf binary protocol and compresses all data in-process 
 - **All 15 API endpoints** -- write, query, delete, metadata, retention, streaming, derived queries, anomaly detection, and forecasting
 - **TypeScript-first** -- full type definitions for every request and response
 
+## Compatibility
+
+**Requires TimeStar server >= 1.0.7** (`funkbuild/timestar:1.0.7`).
+
+Since client 1.1.0, compressed write payloads are sent **instead of** the raw
+arrays. Servers older than 1.0.7 ignored the `compressed_*` protobuf fields
+entirely, so compressed writes against them return success while **silently
+storing zero points**. Do not use this client with older servers.
+
+Other server 1.0.7 behaviors this client relies on / surfaces:
+
+- **Flat error responses**: all endpoints return
+  `{"status":"error","error_code":"<CODE>","message":"<msg>","error":"<msg>"}`
+  (`error_code` omitted when uncoded). The client also still tolerates the
+  legacy nested `{"error":{"code","message"}}` shape from older servers.
+- **Protobuf content-type**: protobuf responses carry
+  `Content-Type: application/x-protobuf` (older servers said `application/json`).
+  The client accepts both.
+- **Boolean query values are numeric `0`/`1`** on every query path (older
+  servers returned `true`/`false` on some paths).
+- **Deterministic response shape**: multi-field queries always return one
+  series per measurement+tags with fields consolidated, regardless of shard
+  placement.
+
 ## Prerequisites
 
 | Requirement | Version | Notes |
@@ -76,6 +100,19 @@ await client.write({
 });
 ```
 
+Write semantics worth knowing:
+
+- **`pointsWritten` counts field-points**: fields × timestamps per point. A
+  point with 3 fields and 10 timestamps reports `pointsWritten: 30`.
+- **Duplicate points append**: writing an identical
+  measurement+tags+field+timestamp again APPENDS another value at that
+  timestamp — it is not last-write-wins. Queries will see both values (and
+  aggregations will include both). Deduplicate client-side if you need
+  overwrite semantics.
+- **Partial failures**: invalid points/fields are skipped and reported in
+  `WriteResponse.errors` with `status: "partial"` — the write is not rolled
+  back.
+
 ### Field Type Detection
 
 Field values are auto-detected from their contents:
@@ -119,6 +156,9 @@ for (const series of result.series) {
   console.log(series.fields.usage.values);
 }
 ```
+
+Note: boolean fields come back as **numeric `0`/`1`** values (server >= 1.0.7
+aggregates booleans numerically on every query path).
 
 ### Derived Queries
 
@@ -212,7 +252,7 @@ for await (const batch of client.subscribe({ query: "SELECT usage FROM cpu" })) 
 
 ## Compression
 
-The client uses **Approach B**: field values and timestamps are compressed client-side into `bytes` fields within the protobuf messages. The server decompresses them directly, avoiding any intermediate representation.
+The client uses **Approach B**: field values and timestamps are compressed client-side into `bytes` fields within the protobuf messages, **replacing** the raw repeated arrays on the wire. The server (>= 1.0.7) decodes them directly, avoiding any intermediate representation. Value arrays are compressed when their length matches the timestamp count (>= 2 values); scalars and mismatched-length arrays are sent raw so server-side validation semantics are unchanged.
 
 Four compression algorithms are used, each matched to its data type:
 
@@ -254,7 +294,8 @@ The `TimestarClient` constructor accepts a `TimestarClientOptions` object:
 | `host` | `string` | `"localhost"` | TimeStar server hostname |
 | `port` | `number` | `8086` | TimeStar server port |
 | `authToken` | `string` | `undefined` | Bearer token for authentication |
-| `useProtobuf` | `boolean` | `true` | Use protobuf binary protocol. Set to `false` for JSON. |
+| `useProtobuf` | `boolean` | `true` | Deprecated — the client always uses protobuf; this option is ignored. |
+| `requestTimeoutMs` | `number` | `30000` | Per-request timeout in milliseconds |
 
 ## Error Handling
 
@@ -269,10 +310,20 @@ try {
   if (err instanceof TimestarError) {
     console.error(err.message);    // Error message from the server
     console.error(err.statusCode); // HTTP status code
-    console.error(err.code);       // Optional error code
+    console.error(err.code);       // Machine-readable code (e.g. "INVALID_QUERY"), when provided
   }
 }
 ```
+
+The client understands both the flat error shape emitted by server >= 1.0.7
+(`{"status":"error","error_code","message","error"}` — where `error_code`
+populates `err.code`) and the protobuf error messages each endpoint returns
+to protobuf clients. Legacy nested JSON errors from older servers are also
+parsed.
+
+Note that per-point write failures do NOT throw: `/write` returns HTTP 200
+with `status: "partial"` and the per-point messages in
+`WriteResponse.errors` (see Write semantics above).
 
 ## License
 

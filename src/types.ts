@@ -33,9 +33,15 @@ export interface WriteRequest {
 }
 
 export interface WriteResponse {
+  /** "success", "partial" (some points/fields failed — see errors), or "error". */
   status: string;
+  /**
+   * Number of FIELD-points written: fields x timestamps per point.
+   * A point with 3 fields and 10 timestamps counts as 30.
+   */
   pointsWritten: number;
   failedWrites: number;
+  /** Per-point/per-field error messages (capped by the server, currently at 10). */
   errors: string[];
 }
 
@@ -51,6 +57,11 @@ export interface QueryOptions {
 
 export interface FieldData {
   timestamps: Array<number | bigint>;
+  /**
+   * Field values. Note: boolean fields are returned as NUMERIC 0/1 by
+   * server >= 1.0.7 (all query paths aggregate booleans numerically).
+   * The boolean[] member remains only for compatibility with older servers.
+   */
   values: number[] | bigint[] | boolean[] | string[];
 }
 

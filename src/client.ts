@@ -13,10 +13,12 @@ import {
 import {
   compressTimestamps,
   decompressTimestamps,
+  decompressTimestampsBigInt,
   compressDoubles,
   decompressDoubles,
   compressIntegers,
   decompressIntegers,
+  decompressIntegersBigInt,
   compressBooleans,
   decompressBooleans,
   compressStrings,
@@ -58,6 +60,7 @@ export class TimestarClient {
   private readonly baseUrl: string;
   private readonly authToken?: string;
   private readonly requestTimeoutMs: number;
+  private readonly precise: boolean;
   private initPromise: Promise<void> | null = null;
 
   constructor(options: TimestarClientOptions = {}) {
@@ -66,6 +69,7 @@ export class TimestarClient {
     this.baseUrl = `http://${host}:${port}`;
     this.authToken = options.authToken;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
+    this.precise = options.precise ?? false;
   }
 
   // Race-safe init: caches the Promise so concurrent callers share one init.
@@ -156,18 +160,18 @@ export class TimestarClient {
     // Protobuf error body — decode with the endpoint's response message first
     try {
       if (resCodecKey === "WriteResponse") {
-        const wr = await codecs.WriteResponse.decode(new Uint8Array(res.body));
+        const wr = await codecs.WriteResponse.decode(res.body);
         throw new TimestarError(wr.errors?.join("; ") || wr.status || bodyText, res.status);
       }
       if (resCodecKey === "QueryResponse") {
-        const qr = await codecs.QueryResponse.decode(new Uint8Array(res.body));
+        const qr = await codecs.QueryResponse.decode(res.body);
         throw new TimestarError(qr.errorMessage || qr.status || bodyText, res.status, qr.errorCode || undefined);
       }
       if (resCodecKey === "DerivedQueryResponse") {
-        const dr = await codecs.DerivedQueryResponse.decode(new Uint8Array(res.body));
+        const dr = await codecs.DerivedQueryResponse.decode(res.body);
         throw new TimestarError(dr.errorMessage || dr.status || bodyText, res.status, dr.errorCode || undefined);
       }
-      const errRes = await codecs.StatusResponse.decode(new Uint8Array(res.body));
+      const errRes = await codecs.StatusResponse.decode(res.body);
       throw new TimestarError(errRes.message || errRes.status, res.status, errRes.code || undefined);
     } catch (e) {
       if (e instanceof TimestarError) throw e;
@@ -196,7 +200,7 @@ export class TimestarClient {
     if (res.status >= 400) {
       await this.throwServerError(res, resCodecKey);
     }
-    return resCodec.decode(new Uint8Array(res.body));
+    return resCodec.decode(res.body);
   }
 
   private async protoGet<TRes>(
@@ -224,7 +228,7 @@ export class TimestarClient {
     if (res.status >= 400) {
       await this.throwServerError(res);
     }
-    return resCodec.decode(new Uint8Array(res.body));
+    return resCodec.decode(res.body);
   }
 
   // ---------------------------------------------------------------------------
@@ -267,8 +271,8 @@ export class TimestarClient {
 
   async query(query: string, options: QueryOptions = {}): Promise<QueryResponse> {
     const payload: any = { query };
-    if (options.startTime !== undefined) payload.startTime = Number(options.startTime);
-    if (options.endTime !== undefined) payload.endTime = Number(options.endTime);
+    if (options.startTime !== undefined) payload.startTime = timeToWire(options.startTime);
+    if (options.endTime !== undefined) payload.endTime = timeToWire(options.endTime);
     if (options.aggregationInterval !== undefined) payload.aggregationInterval = options.aggregationInterval;
 
     { const p = this.ensureInit(); if (p) await p; }
@@ -283,8 +287,8 @@ export class TimestarClient {
     if (res.status >= 400) {
       await this.throwServerError(res, "QueryResponse");
     }
-    const proto = await codecs.QueryResponse.decode(new Uint8Array(res.body));
-    return convertQueryResponse(proto);
+    const proto = await codecs.QueryResponse.decode(res.body);
+    return convertQueryResponse(proto, options.precise ?? this.precise);
   }
 
   // ---------------------------------------------------------------------------
@@ -515,8 +519,8 @@ export class TimestarClient {
     const payload: any = {
       queries: protoQueries,
       formula,
-      startTime: Number(options.startTime),
-      endTime: Number(options.endTime),
+      startTime: timeToWire(options.startTime),
+      endTime: timeToWire(options.endTime),
     };
     if (options.aggregationInterval) {
       payload.aggregationInterval = options.aggregationInterval;
@@ -544,8 +548,8 @@ export class TimestarClient {
     const payload: any = {
       queries: protoQueries,
       formula,
-      startTime: Number(options.startTime),
-      endTime: Number(options.endTime),
+      startTime: timeToWire(options.startTime),
+      endTime: timeToWire(options.endTime),
     };
     if (options.aggregationInterval) {
       payload.aggregationInterval = options.aggregationInterval;
@@ -565,7 +569,7 @@ export class TimestarClient {
     if (res.status >= 400) {
       await this.throwServerError(res, "DerivedQueryResponse");
     }
-    const proto = await codecs.AnomalyResponse.decode(new Uint8Array(res.body));
+    const proto = await codecs.AnomalyResponse.decode(res.body);
     return convertAnomalyResponse(proto);
   }
 
@@ -582,8 +586,8 @@ export class TimestarClient {
     const payload: any = {
       queries: protoQueries,
       formula,
-      startTime: Number(options.startTime),
-      endTime: Number(options.endTime),
+      startTime: timeToWire(options.startTime),
+      endTime: timeToWire(options.endTime),
     };
     if (options.aggregationInterval) {
       payload.aggregationInterval = options.aggregationInterval;
@@ -602,7 +606,7 @@ export class TimestarClient {
     if (res.status >= 400) {
       await this.throwServerError(res, "DerivedQueryResponse");
     }
-    const proto = await codecs.ForecastResponse.decode(new Uint8Array(res.body));
+    const proto = await codecs.ForecastResponse.decode(res.body);
     return convertForecastResponse(proto);
   }
 }
@@ -638,6 +642,19 @@ export class TimestarError extends Error {
 // and single-timestamp replication semantics stay unchanged.
 const shouldCompress = (len: number, tsCount: number): boolean => len >= 2 && len === tsCount;
 
+// [C1] Convert a bigint to a proto-safe int64/uint64 wire value without
+// precision loss. protobufjs does NOT accept bare bigint (it silently encodes
+// 0), but decimal strings are converted via Long with full 64-bit precision.
+// Numbers are cheaper to encode, so they're used when exactly representable.
+function bigintToWire(v: bigint): number | string {
+  return v >= -9007199254740991n && v <= 9007199254740991n ? Number(v) : v.toString();
+}
+
+// int64/uint64 wire value for a number-or-bigint input (raw proto paths).
+function timeToWire(v: number | bigint): number | string {
+  return typeof v === "bigint" ? bigintToWire(v) : v;
+}
+
 // Detect field type from a plain array by inspecting the first element.
 // `tsCount` is the number of timestamps on the enclosing write point.
 function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | null {
@@ -645,7 +662,7 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
   if (typeof val === "number") return { doubleValues: { values: [val] } };
   if (typeof val === "boolean") return { boolValues: { values: [val] } };
   if (typeof val === "string") return { stringValues: { values: [val] } };
-  if (typeof val === "bigint") return { int64Values: { values: [Number(val)] } };
+  if (typeof val === "bigint") return { int64Values: { values: [bigintToWire(val)] } };
 
   // Plain array — auto-detect type from first element
   if (Array.isArray(val) && val.length > 0) {
@@ -669,10 +686,11 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
         : { stringValues: { values: strs } };
     }
     if (typeof first === "bigint") {
-      const ints = (val as bigint[]).map(Number);
+      // [C1] Carry bigints through at full 64-bit precision — no Number().
+      const ints = val as bigint[];
       return shouldCompress(ints.length, tsCount)
         ? { int64Values: { compressedFfor: compressIntegers(ints) } }
-        : { int64Values: { values: ints } };
+        : { int64Values: { values: ints.map(bigintToWire) } };
     }
   }
 
@@ -699,10 +717,10 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
       : { stringValues: { values: wf.stringValues } };
   }
   if (wf.int64Values) {
-    const nums = wf.int64Values.map(Number);
-    return shouldCompress(nums.length, tsCount)
-      ? { int64Values: { compressedFfor: compressIntegers(nums) } }
-      : { int64Values: { values: nums } };
+    // [C1] Carry bigints through at full 64-bit precision — no Number().
+    return shouldCompress(wf.int64Values.length, tsCount)
+      ? { int64Values: { compressedFfor: compressIntegers(wf.int64Values) } }
+      : { int64Values: { values: wf.int64Values.map(timeToWire) } };
   }
 
   return null;
@@ -728,7 +746,8 @@ function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
   if (tsCount >= 2) {
     base.compressedTimestamps = compressTimestamps(point.timestamps);
   } else {
-    base.timestamps = point.timestamps.map(Number);
+    // [C2] Preserve bigint timestamps exactly on the raw path (no Number()).
+    base.timestamps = point.timestamps.map(timeToWire);
   }
   return base;
 }
@@ -740,8 +759,8 @@ function normalizeDeleteRequest(item: DeleteRequestItem): any {
   if (item.tags) result.tags = item.tags;
   if (item.field) result.field = item.field;
   if (item.fields) result.fields = item.fields;
-  if (item.startTime !== undefined) result.startTime = Number(item.startTime);
-  if (item.endTime !== undefined) result.endTime = Number(item.endTime);
+  if (item.startTime !== undefined) result.startTime = timeToWire(item.startTime);
+  if (item.endTime !== undefined) result.endTime = timeToWire(item.endTime);
   return result;
 }
 
@@ -750,7 +769,7 @@ function normalizeSubscribeRequest(req: SubscribeRequest): any {
   if (req.query) result.query = req.query;
   if (req.queries) result.queries = req.queries;
   if (req.formula) result.formula = req.formula;
-  if (req.startTime !== undefined) result.startTime = Number(req.startTime);
+  if (req.startTime !== undefined) result.startTime = timeToWire(req.startTime);
   if (req.backfill !== undefined) result.backfill = req.backfill;
   if (req.aggregationInterval) result.aggregationInterval = req.aggregationInterval;
   return result;
@@ -791,9 +810,17 @@ function readFforTotalCount(compressed: Uint8Array): number {
 // Decompress field data. Self-describing formats (ALP, zstd) are decompressed first
 // to provide counts. For non-self-describing formats (FFOR, RLE), we extract the count
 // from the FFOR timestamp header or decompress timestamps first.
-function decompressFieldData(protoFd: ProtoFieldData): FieldData {
+//
+// [C2] `precise: true` returns bigint[] for timestamps and int64 field values
+// (full 64-bit precision). The default returns number[], which silently
+// rounds values beyond 2^53 — including realistic nanosecond timestamps.
+// Raw (uncompressed) fallback arrays were already decoded by protobufjs with
+// longs: Number, so in precise mode they are converted to bigint for a
+// consistent return type, but precision beyond 2^53 cannot be recovered on
+// that path (only older servers send raw arrays).
+function decompressFieldData(protoFd: ProtoFieldData, precise: boolean): FieldData {
   // Step 1: Try self-describing value formats first
-  let values: number[] | boolean[] | string[];
+  let values: number[] | bigint[] | boolean[] | string[];
   let valueCount = 0;
 
   if (protoFd.doubleValues?.compressedAlp && protoFd.doubleValues.compressedAlp.length > 0) {
@@ -817,22 +844,28 @@ function decompressFieldData(protoFd: ProtoFieldData): FieldData {
   }
 
   // Step 2: Decompress timestamps
-  let timestamps: number[];
+  let timestamps: number[] | bigint[];
   if (protoFd.compressedTimestamps && protoFd.compressedTimestamps.length > 0) {
     const count = valueCount > 0 ? valueCount : (protoFd.timestamps?.length ?? 0);
-    timestamps = decompressTimestamps(toBuffer(protoFd.compressedTimestamps), count);
+    timestamps = precise
+      ? decompressTimestampsBigInt(toBuffer(protoFd.compressedTimestamps), count)
+      : decompressTimestamps(toBuffer(protoFd.compressedTimestamps), count);
   } else {
-    timestamps = protoFd.timestamps ?? [];
+    timestamps = precise
+      ? (protoFd.timestamps ?? []).map(BigInt)
+      : protoFd.timestamps ?? [];
   }
 
   // Step 3: Decompress int64/bool values using timestamps.length as count
   if (values.length === 0) {
     if (protoFd.int64Values?.compressedFfor && protoFd.int64Values.compressedFfor.length > 0) {
-      values = decompressIntegers(toBuffer(protoFd.int64Values.compressedFfor), timestamps.length);
+      values = precise
+        ? decompressIntegersBigInt(toBuffer(protoFd.int64Values.compressedFfor), timestamps.length)
+        : decompressIntegers(toBuffer(protoFd.int64Values.compressedFfor), timestamps.length);
     } else if (protoFd.boolValues?.compressedRle && protoFd.boolValues.compressedRle.length > 0) {
       values = decompressBooleans(toBuffer(protoFd.boolValues.compressedRle), timestamps.length);
     } else if (protoFd.int64Values?.values) {
-      values = protoFd.int64Values.values;
+      values = precise ? protoFd.int64Values.values.map(BigInt) : protoFd.int64Values.values;
     } else if (protoFd.boolValues?.values) {
       values = protoFd.boolValues.values;
     }
@@ -841,11 +874,11 @@ function decompressFieldData(protoFd: ProtoFieldData): FieldData {
   return { timestamps, values };
 }
 
-function convertQueryResponse(proto: ProtoQueryResponse): QueryResponse {
+function convertQueryResponse(proto: ProtoQueryResponse, precise: boolean): QueryResponse {
   const series: SeriesResult[] = (proto.series ?? []).map((s) => {
     const fields: Record<string, FieldData> = {};
     for (const [fieldName, fd] of Object.entries(s.fields ?? {})) {
-      fields[fieldName] = decompressFieldData(fd);
+      fields[fieldName] = decompressFieldData(fd, precise);
     }
     return {
       measurement: s.measurement,

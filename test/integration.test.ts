@@ -169,6 +169,106 @@ describe("Compressed protobuf round-trip", () => {
 });
 
 // ============================================================================
+// 64-bit precision round-trip (C1/C2)
+//
+// Read-back type decision (documented):
+//   - timestamps: number[] by default (rounded beyond 2^53 — realistic ns
+//     epoch values lose up to ~128ns); bigint[] with { precise: true },
+//     exact through the server round-trip.
+//   - int64 field values: the CLIENT preserves full 64-bit precision on the
+//     wire in both directions (verified by codec tests in compression.test.ts)
+//     and returns bigint[] in precise mode when the server sends int64 wire
+//     data. However, the CURRENT server's query path aggregates int64 fields
+//     numerically and returns them as ALP doubles, so values beyond 2^53 are
+//     read back as the nearest double (number[]) — identical to
+//     Number(exact bigint) — regardless of the precise option. That cap is
+//     server-side; the client never rounds before encoding.
+// ============================================================================
+
+describe("64-bit precision round-trip", () => {
+  const measurement = `${PREFIX}.precision`;
+  const N = 50;
+  // Odd ns timestamps beyond 2^53 — NOT representable as doubles
+  const timestamps = Array.from({ length: N }, (_, i) => 1_700_000_000_000_000_001n + BigInt(i) * 1_000_000_001n);
+  // int64 values beyond 2^53
+  const bigints = Array.from({ length: N }, (_, i) => 2n ** 60n + 12345n + BigInt(i));
+
+  it("writes bigint timestamps/values beyond 2^53 and reads exact bigint timestamps with precise: true", async () => {
+    if (requireServer()) return;
+    const w = await client.write({
+      measurement,
+      tags: { host: "px1" },
+      fields: { big: { int64Values: bigints } },
+      timestamps,
+    });
+    expect(w.status).toBe("success");
+    expect(w.failedWrites).toBe(0);
+
+    const resp = await client.query(`avg:${measurement}(big)`, {
+      startTime: timestamps[0] - 10n,
+      endTime: timestamps[N - 1] + 10n,
+      precise: true,
+    });
+    expect(resp.status).toBe("success");
+    const fd = findField(resp, "big");
+
+    // Timestamps: exact bigint round-trip, including the +1ns offsets that a
+    // double cannot represent.
+    expect(fd.timestamps).toEqual(timestamps);
+    expect(typeof fd.timestamps[0]).toBe("bigint");
+
+    // int64 values: server aggregation returns doubles; each must equal the
+    // nearest double to the exact written value (proving the client did not
+    // round to a DIFFERENT int64 before encoding is covered by codec tests).
+    expect(fd.values.length).toBe(N);
+    for (let i = 0; i < N; i++) {
+      expect(fd.values[i]).toBe(Number(bigints[i]));
+    }
+  });
+
+  it("default (non-precise) mode returns Number-rounded timestamps", async () => {
+    if (requireServer()) return;
+    const resp = await client.query(`avg:${measurement}(big)`, {
+      startTime: timestamps[0] - 10n,
+      endTime: timestamps[N - 1] + 10n,
+    });
+    expect(resp.status).toBe("success");
+    const fd = findField(resp, "big");
+    expect(typeof fd.timestamps[0]).toBe("number");
+    for (let i = 0; i < N; i++) {
+      expect(fd.timestamps[i]).toBe(Number(timestamps[i]));
+    }
+  });
+
+  it("preserves scalar bigint fields and single bigint timestamps on the raw proto path", async () => {
+    if (requireServer()) return;
+    // tsCount == 1 skips compression: exercises the string-encoded int64/uint64
+    // raw path through protobufjs (bare bigint would silently encode as 0).
+    const ts = 1_700_000_050_000_000_007n;
+    const w = await client.write({
+      measurement: `${measurement}_scalar`,
+      tags: { host: "px2" },
+      fields: { big: 2n ** 60n + 7n, temp: 21.5 },
+      timestamps: [ts],
+    });
+    expect(w.status).toBe("success");
+    expect(w.failedWrites).toBe(0);
+
+    const resp = await client.query(`latest:${measurement}_scalar()`, {
+      startTime: ts - 10n,
+      endTime: ts + 10n,
+      precise: true,
+    });
+    expect(resp.status).toBe("success");
+    const fd = findField(resp, "big");
+    expect(fd.timestamps).toEqual([ts]); // exact — proves no Number() rounding on write
+    expect(fd.values[0]).toBe(Number(2n ** 60n + 7n));
+    const temp = findField(resp, "temp");
+    expect(temp.values[0]).toBe(21.5);
+  });
+});
+
+// ============================================================================
 // Corrupt compressed payloads (requires server >= 1.0.7)
 //
 // The server must reject corrupt compressed bytes with per-point errors and a

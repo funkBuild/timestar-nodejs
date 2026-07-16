@@ -34,8 +34,11 @@ function makeAsyncCodec<T = unknown>(typeName: string): AsyncProtoCodec<T> {
   return {
     async encode(message: T): Promise<Uint8Array> {
       const type = await getTypeOnce();
-      const msg = type.create(message as Record<string, unknown>);
-      return type.encode(msg).finish();
+      // [W1] Encode the plain object directly. type.create() walks the whole
+      // tree building Message instances only to feed them to the same encoder,
+      // which accepts plain objects — and proto3 encoding skips absent fields
+      // either way, so no create()-applied defaults are relied upon.
+      return type.encode(message as Record<string, unknown>).finish();
     },
     async decode(buffer: Uint8Array): Promise<T> {
       const type = await getTypeOnce();
@@ -57,14 +60,17 @@ export interface ProtoWriteField {
   doubleValues?: { values?: number[]; compressedAlp?: Uint8Array };
   boolValues?: { values?: boolean[]; compressedRle?: Uint8Array };
   stringValues?: { values?: string[]; compressedZstd?: Uint8Array; count?: number };
-  int64Values?: { values?: Array<number | Long>; compressedFfor?: Uint8Array };
+  // int64 wire values: protobufjs encodes decimal strings via Long with full
+  // 64-bit precision — used for bigint inputs beyond 2^53. Bare bigint is NOT
+  // accepted by protobufjs (silently encodes 0), hence string.
+  int64Values?: { values?: Array<number | string | Long>; compressedFfor?: Uint8Array };
 }
 
 export interface ProtoWritePoint {
   measurement: string;
   tags?: Record<string, string>;
   fields?: Record<string, ProtoWriteField>;
-  timestamps?: Array<number | Long>;
+  timestamps?: Array<number | string | Long>;
   compressedTimestamps?: Uint8Array;
 }
 
@@ -81,8 +87,9 @@ export interface ProtoWriteResponse {
 
 export interface ProtoQueryRequest {
   query: string;
-  startTime?: number;
-  endTime?: number;
+  // Decimal strings are accepted for exact uint64 encoding of bigint inputs.
+  startTime?: number | string;
+  endTime?: number | string;
   aggregationInterval?: string;
 }
 

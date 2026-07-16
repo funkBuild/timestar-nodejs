@@ -53,7 +53,12 @@ const FIELD_NAMES = [
 ];
 const HOSTS = Array.from({ length: 10 }, (_, i) => `host-${String(i + 1).padStart(2, "0")}`);
 const RACKS = ["rack-1", "rack-2"];
-const BASE_TS = 1_000_000_000_000_000_000; // 1e18 ns
+// Base timestamp must keep every generated timestamp exactly representable as
+// a double (< 2^53 = 9.007e15), so number-typed timestamps round-trip exactly
+// through query result decoding. 1.6e15 ns keeps the same data shape (minute
+// intervals) while leaving headroom for large --batches configs; a guard in
+// main() rejects configs that would cross 2^53.
+const BASE_TS = 1_600_000_000_000_000; // 1.6e15 ns
 const MINUTE_NS = 60_000_000_000;
 
 // ============================================================================
@@ -70,13 +75,15 @@ class PRNG {
     this.s[3] = seed ^ 0xcafebabe;
     for (let i = 0; i < 20; i++) this.next();
   }
+  // xoshiro128**: result = rotl(s[1] * 5, 7) * 9
   next(): number {
     const s = this.s;
-    const result = Math.imul(s[1] * 5, 0) >>> 0;
+    const p = Math.imul(s[1], 5);
+    const result = Math.imul((p << 7) | (p >>> 25), 9) >>> 0;
     const t = s[1] << 9;
     s[2] ^= s[0]; s[3] ^= s[1]; s[1] ^= s[2]; s[0] ^= s[3];
     s[2] ^= t; s[3] = (s[3] << 11) | (s[3] >>> 21);
-    return (result >>> 0) / 0x100000000;
+    return result / 0x100000000;
   }
   float(min: number, max: number): number {
     return min + this.next() * (max - min);
@@ -170,39 +177,38 @@ async function benchmarkWrites(client: TimestarClient): Promise<{
   const genMs = performance.now() - genStart;
   console.log(`Data generation: ${genMs.toFixed(0)}ms`);
 
-  // Write with concurrency
+  // Write with a sliding-window pool: CONCURRENCY requests are kept
+  // continuously in flight, refilling on each completion (no head-of-line
+  // blocking from grouped Promise.all chunks).
   const batchLatencies: number[] = [];
-  let batchIdx = 0;
+  let nextBatch = 0;
+  let completed = 0;
 
   console.log(`\nWriting with concurrency=${CONCURRENCY}...`);
   const writeStart = performance.now();
 
-  while (batchIdx < NUM_BATCHES) {
-    const chunk: Promise<number>[] = [];
-    const end = Math.min(batchIdx + CONCURRENCY, NUM_BATCHES);
+  async function writeWorker(): Promise<void> {
+    while (true) {
+      const b = nextBatch++;
+      if (b >= NUM_BATCHES) return;
+      const t0 = performance.now();
+      await client.write(batches[b]);
+      batchLatencies.push(performance.now() - t0);
+      completed++;
 
-    for (let i = batchIdx; i < end; i++) {
-      const b = i;
-      chunk.push((async () => {
-        const t0 = performance.now();
-        await client.write(batches[b]);
-        const latency = performance.now() - t0;
-        return latency;
-      })());
-    }
-
-    const latencies = await Promise.all(chunk);
-    batchLatencies.push(...latencies);
-    batchIdx = end;
-
-    // Progress
-    if (batchIdx % 20 === 0 || batchIdx === NUM_BATCHES) {
-      const elapsed = (performance.now() - writeStart) / 1000;
-      const pointsSoFar = batchIdx * pointsPerBatch;
-      const rate = pointsSoFar / elapsed;
-      process.stdout.write(`\r  ${batchIdx}/${NUM_BATCHES} batches (${(rate / 1e6).toFixed(2)}M pts/sec)`);
+      // Progress
+      if (completed % 20 === 0 || completed === NUM_BATCHES) {
+        const elapsed = (performance.now() - writeStart) / 1000;
+        const pointsSoFar = completed * pointsPerBatch;
+        const rate = pointsSoFar / elapsed;
+        process.stdout.write(`\r  ${completed}/${NUM_BATCHES} batches (${(rate / 1e6).toFixed(2)}M pts/sec)`);
+      }
     }
   }
+
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, NUM_BATCHES) }, () => writeWorker())
+  );
 
   const wallMs = performance.now() - writeStart;
   const wallSec = wallMs / 1000;
@@ -492,6 +498,13 @@ function printReport(
 async function main() {
   console.log("TimeStar Node.js Client Benchmark");
   console.log(`Target: ${HOST}:${PORT}`);
+
+  // Guard: all generated timestamps must stay exactly representable doubles.
+  const maxTs = BASE_TS + NUM_BATCHES * BATCH_SIZE * MINUTE_NS;
+  if (maxTs > Number.MAX_SAFE_INTEGER) {
+    console.error(`ERROR: --batches x --batch-size too large: max timestamp ${maxTs} exceeds 2^53 (would lose precision with number timestamps)`);
+    process.exit(1);
+  }
 
   const client = new TimestarClient({ host: HOST, port: PORT, useProtobuf: true });
 

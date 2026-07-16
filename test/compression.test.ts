@@ -2,10 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   compressTimestamps,
   decompressTimestamps,
+  decompressTimestampsBigInt,
   compressDoubles,
   decompressDoubles,
   compressIntegers,
   decompressIntegers,
+  decompressIntegersBigInt,
   compressBooleans,
   decompressBooleans,
   compressStrings,
@@ -472,6 +474,119 @@ describe("Block boundary tests", () => {
         expect(decompressed[i]).toBe(vals[i]);
       }
     });
+  });
+});
+
+// ============================================================================
+// 64-bit precision (Q2/C1/C2)
+//
+// The number-returning decoders combine two uint32 reads instead of allocating
+// a BigInt per element. These tests pin the required invariant: the result is
+// value-identical to Number(bigint) for EVERY 64-bit value, including the
+// nearest-even rounding beyond 2^53. The bigint decoders must be exact.
+// ============================================================================
+
+describe("64-bit precision", () => {
+  // Deterministic 32-bit LCG for reproducible property tests
+  function makeLcg(seed: number) {
+    let s = seed >>> 0;
+    return () => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s;
+    };
+  }
+
+  const U64_BOUNDARIES: bigint[] = [
+    0n, 1n, 2n, 127n, 128n,
+    2n ** 31n - 1n, 2n ** 31n, 2n ** 32n - 1n, 2n ** 32n, 2n ** 32n + 1n,
+    2n ** 53n - 1n, 2n ** 53n, 2n ** 53n + 1n, 2n ** 53n + 2n, 2n ** 53n + 3n,
+    2n ** 60n + 12345n,
+    1_700_000_000_000_000_001n, // realistic ns timestamp, not representable as double
+    2n ** 63n - 1n, 2n ** 63n, 2n ** 63n + 1n, 2n ** 64n - 1n,
+  ];
+
+  const I64_BOUNDARIES: bigint[] = [
+    0n, 1n, -1n, 127n, -128n,
+    2n ** 31n - 1n, -(2n ** 31n), 2n ** 32n - 1n, -(2n ** 32n),
+    2n ** 53n - 1n, 2n ** 53n + 1n, -(2n ** 53n) - 1n, -(2n ** 53n) - 3n,
+    2n ** 60n + 12345n, -(2n ** 60n) - 12345n,
+    2n ** 63n - 1n, -(2n ** 63n),
+  ];
+
+  it("uint64 decode-as-number is value-identical to Number(bigint) at boundaries", () => {
+    const compressed = compressTimestamps(U64_BOUNDARIES);
+    const asNumbers = decompressTimestamps(compressed, U64_BOUNDARIES.length);
+    for (let i = 0; i < U64_BOUNDARIES.length; i++) {
+      expect(asNumbers[i]).toBe(Number(U64_BOUNDARIES[i]));
+    }
+  });
+
+  it("int64 decode-as-number is value-identical to Number(bigint) at boundaries", () => {
+    const compressed = compressIntegers(I64_BOUNDARIES);
+    const asNumbers = decompressIntegers(compressed, I64_BOUNDARIES.length);
+    for (let i = 0; i < I64_BOUNDARIES.length; i++) {
+      expect(asNumbers[i]).toBe(Number(I64_BOUNDARIES[i]));
+    }
+  });
+
+  it("property: random uint64 values decode-as-number identically to Number(bigint)", () => {
+    const rng = makeLcg(0xC0FFEE);
+    const vals: bigint[] = Array.from({ length: 4096 }, () => {
+      // Vary magnitude: mask hi word by a random bit width to hit all ranges
+      const hi = BigInt(rng() >>> (rng() % 33));
+      return (hi << 32n) | BigInt(rng());
+    });
+    const asNumbers = decompressTimestamps(compressTimestamps(vals), vals.length);
+    const asBigints = decompressTimestampsBigInt(compressTimestamps(vals), vals.length);
+    for (let i = 0; i < vals.length; i++) {
+      expect(asNumbers[i]).toBe(Number(vals[i]));
+      expect(asBigints[i]).toBe(vals[i]);
+    }
+  });
+
+  it("property: random int64 values decode-as-number identically to Number(bigint)", () => {
+    const rng = makeLcg(0xDECAF);
+    const vals: bigint[] = Array.from({ length: 4096 }, () => {
+      const hi = BigInt(rng() >>> (rng() % 33));
+      const u = (hi << 32n) | BigInt(rng());
+      return BigInt.asIntN(64, u);
+    });
+    const asNumbers = decompressIntegers(compressIntegers(vals), vals.length);
+    const asBigints = decompressIntegersBigInt(compressIntegers(vals), vals.length);
+    for (let i = 0; i < vals.length; i++) {
+      expect(asNumbers[i]).toBe(Number(vals[i]));
+      expect(asBigints[i]).toBe(vals[i]);
+    }
+  });
+
+  it("bigint int64 write values beyond 2^53 round-trip exactly (C1)", () => {
+    const vals = [2n ** 60n + 12345n, -(2n ** 60n) - 12345n, 2n ** 63n - 1n, -(2n ** 63n), 42n];
+    const decoded = decompressIntegersBigInt(compressIntegers(vals), vals.length);
+    expect(decoded).toEqual(vals);
+  });
+
+  it("bigint timestamps beyond 2^53 round-trip exactly (C2)", () => {
+    const ts = Array.from({ length: 500 }, (_, i) => 1_700_000_000_000_000_001n + BigInt(i) * 60_000_000_001n);
+    const decoded = decompressTimestampsBigInt(compressTimestamps(ts), ts.length);
+    expect(decoded).toEqual(ts);
+  });
+
+  it("number write path encodes identically to bigint write path (W2)", () => {
+    // 2^60-magnitude doubles are spaced 256 apart; use representable offsets
+    const base = 2 ** 60;
+    const nums = [base, base + 256, base + 512, base + 1024];
+    const bigs = nums.map(BigInt); // exact: each is representable
+    expect(Buffer.compare(compressTimestamps(nums), compressTimestamps(bigs))).toBe(0);
+
+    const inums = [-1, -4294967296, -9007199254740991, 9007199254740991, 0, 12345];
+    const ibigs = inums.map(BigInt);
+    expect(Buffer.compare(compressIntegers(inums), compressIntegers(ibigs))).toBe(0);
+  });
+
+  it("mixed number/bigint timestamp arrays encode consistently", () => {
+    const mixed: Array<number | bigint> = [1_600_000_000_000_000, 1_600_000_060_000_000n, 1_600_000_120_000_000];
+    const allBig = mixed.map((v) => BigInt(v));
+    expect(Buffer.compare(compressTimestamps(mixed), compressTimestamps(allBig))).toBe(0);
   });
 });
 

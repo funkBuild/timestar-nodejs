@@ -160,6 +160,45 @@ for (const series of result.series) {
 Note: boolean fields come back as **numeric `0`/`1`** values (server >= 1.0.7
 aggregates booleans numerically on every query path).
 
+### 64-bit Precision
+
+JavaScript numbers hold at most 53 bits of integer precision, and nanosecond
+epoch timestamps (~1.7e18) exceed that — so by default, query results round
+timestamps (and int64 field values) to the nearest representable double, which
+can be off by up to ~128ns at current epoch values.
+
+Opt in to exact `bigint[]` results with `precise: true`, per query or
+client-wide:
+
+```ts
+// Per query
+const result = await client.query("avg:cpu(usage){}", {
+  startTime: 1_700_000_000_000_000_000n,
+  endTime: 1_700_000_060_000_000_000n,
+  precise: true,
+});
+// result.series[0].fields.usage.timestamps is bigint[] — exact ns precision
+
+// Client-wide default
+const preciseClient = new TimestarClient({ port: 8086, precise: true });
+```
+
+Precision semantics:
+
+- **Write side always preserves full 64-bit precision on the wire**, with or
+  without `precise`. `bigint` timestamps and `int64Values` are never rounded
+  by the client (values within ±2^53 may be sent as numbers; larger values are
+  carried exactly).
+- **Timestamps** round-trip exactly through the server: write `bigint`
+  timestamps, query with `precise: true`, and you get the identical `bigint[]`
+  back.
+- **int64 field values**: with `precise: true` the client returns `bigint[]`
+  whenever the server sends int64 wire data. Note that current servers
+  aggregate int64 fields numerically and return them as doubles on the query
+  path, so int64 values beyond 2^53 are read back as the nearest double
+  (`number[]`) — a server-side limit; the stored data retains what was
+  written.
+
 ### Derived Queries
 
 Combine multiple queries with a formula:
@@ -296,6 +335,7 @@ The `TimestarClient` constructor accepts a `TimestarClientOptions` object:
 | `authToken` | `string` | `undefined` | Bearer token for authentication |
 | `useProtobuf` | `boolean` | `true` | Deprecated — the client always uses protobuf; this option is ignored. |
 | `requestTimeoutMs` | `number` | `30000` | Per-request timeout in milliseconds |
+| `precise` | `boolean` | `false` | Default for `QueryOptions.precise`: return timestamps and int64 field values as exact `bigint[]` instead of `number[]` (which rounds beyond 2^53). See "64-bit Precision". |
 
 ## Error Handling
 

@@ -53,14 +53,37 @@ export interface QueryOptions {
   startTime?: number | bigint;
   endTime?: number | bigint;
   aggregationInterval?: string;
+  /**
+   * Precision of decoded timestamps and int64 field values.
+   *
+   * Default (false): FieldData.timestamps and int64 values are returned as
+   * number[]. JavaScript numbers hold at most 53 bits of integer precision,
+   * so values beyond 2^53 — which includes ALL realistic nanosecond epoch
+   * timestamps (~1.7e18) — are silently rounded to the nearest representable
+   * double (off by up to ~128ns at current epoch values).
+   *
+   * true: timestamps and int64 field values are returned as bigint[] with
+   * exact 64-bit precision. Doubles, booleans, and strings are unaffected.
+   * Overrides the client-level `precise` option for this query.
+   */
+  precise?: boolean;
 }
 
 export interface FieldData {
+  /**
+   * Point timestamps (nanoseconds). number[] by default — values beyond 2^53
+   * lose precision (see QueryOptions.precise); bigint[] when the query or
+   * client was created with `precise: true`.
+   */
   timestamps: Array<number | bigint>;
   /**
    * Field values. Note: boolean fields are returned as NUMERIC 0/1 by
    * server >= 1.0.7 (all query paths aggregate booleans numerically).
    * The boolean[] member remains only for compatibility with older servers.
+   *
+   * int64 fields are number[] by default (values beyond 2^53 are rounded)
+   * and bigint[] with `precise: true`. The write side always preserves full
+   * 64-bit precision on the wire regardless of this option.
    */
   values: number[] | bigint[] | boolean[] | string[];
 }
@@ -347,4 +370,10 @@ export interface TimestarClientOptions {
   /** @deprecated The client always uses protobuf. This option is ignored. */
   useProtobuf?: boolean;
   requestTimeoutMs?: number;
+  /**
+   * Default for QueryOptions.precise on all queries from this client:
+   * when true, query results return timestamps and int64 field values as
+   * bigint[] (exact 64-bit) instead of number[] (rounded beyond 2^53).
+   */
+  precise?: boolean;
 }

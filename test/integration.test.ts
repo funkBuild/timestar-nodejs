@@ -124,8 +124,14 @@ describe("Compressed protobuf round-trip", () => {
     expect(writeResp.pointsWritten).toBe(4 * N);
     expect(writeResp.failedWrites).toBe(0);
 
+    // startTime must be EXACTLY the first point's timestamp: the server's
+    // no-interval query path collapses the whole range into one aggregated
+    // value when startTime precedes the first data point (or when the data
+    // has been flushed to TSM) — see the SERVER BUG pins in
+    // test/correctness/aggregations.test.ts. startTime == first point is the
+    // stable raw-passthrough shape for memory-store data.
     const resp = await client.query(`avg:${measurement}()`, {
-      startTime: BASE_TS - 1e9,
+      startTime: BASE_TS,
       endTime: BASE_TS + N * 1e9,
     });
     expect(resp.status).toBe("success");
@@ -204,8 +210,10 @@ describe("64-bit precision round-trip", () => {
     expect(w.status).toBe("success");
     expect(w.failedWrites).toBe(0);
 
+    // startTime == first point: avoids the server's no-interval range
+    // collapse (see comment in the compressed round-trip test above).
     const resp = await client.query(`avg:${measurement}(big)`, {
-      startTime: timestamps[0] - 10n,
+      startTime: timestamps[0],
       endTime: timestamps[N - 1] + 10n,
       precise: true,
     });
@@ -228,8 +236,10 @@ describe("64-bit precision round-trip", () => {
 
   it("default (non-precise) mode returns Number-rounded timestamps", async () => {
     if (requireServer()) return;
+    // startTime == first point: avoids the server's no-interval range
+    // collapse (see comment in the compressed round-trip test above).
     const resp = await client.query(`avg:${measurement}(big)`, {
-      startTime: timestamps[0] - 10n,
+      startTime: timestamps[0],
       endTime: timestamps[N - 1] + 10n,
     });
     expect(resp.status).toBe("success");

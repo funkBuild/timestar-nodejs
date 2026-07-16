@@ -255,7 +255,7 @@ export class TimestarClient {
 
   async write(points: WritePoint | WritePoint[]): Promise<WriteResponse> {
     const arr = Array.isArray(points) ? points : [points];
-    const protoPoints = arr.map(normalizeWritePoint);
+    const protoPoints = arr.flatMap(chunkWritePoint).map(normalizeWritePoint);
 
     return this.protoPost<{ writes: ProtoWritePoint[] }, WriteResponse>(
       "/write",
@@ -295,26 +295,23 @@ export class TimestarClient {
   // Delete
   // ---------------------------------------------------------------------------
 
+  // Always sends a BatchDeleteRequest, even for a single item. The server
+  // parses /delete protobuf bodies by trying BatchDeleteRequest FIRST and a
+  // bare DeleteRequest only when batch parsing throws. A bare STRUCTURED
+  // DeleteRequest (measurement=2/tags=3/fields=5, no series=1) happens to be
+  // a valid-but-empty BatchDeleteRequest (all its fields are skipped as
+  // unknown), so the server silently executed ZERO deletes for the old
+  // single-request encoding. Wrapping in a batch of one is unambiguous and
+  // works for every request shape.
   async delete(req: DeleteRequestItem | DeleteRequestItem[]): Promise<DeleteResponse> {
     const items = Array.isArray(req) ? req : [req];
-
-    if (items.length === 1) {
-      const payload = normalizeDeleteRequest(items[0]);
-      return this.protoPost<any, DeleteResponse>(
-        "/delete",
-        "DeleteRequest",
-        "DeleteResponse",
-        payload,
-      );
-    } else {
-      const payload = { deletes: items.map(normalizeDeleteRequest) };
-      return this.protoPost<any, DeleteResponse>(
-        "/delete",
-        "BatchDeleteRequest",
-        "DeleteResponse",
-        payload,
-      );
-    }
+    const payload = { deletes: items.map(normalizeDeleteRequest) };
+    return this.protoPost<any, DeleteResponse>(
+      "/delete",
+      "BatchDeleteRequest",
+      "DeleteResponse",
+      payload,
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -726,6 +723,72 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
   return null;
 }
 
+// [S1] Maximum timestamps per point on the COMPRESSED-timestamp wire path.
+//
+// SERVER BUG WORKAROUND: the server decodes compressed_timestamps with an
+// upper bound of `compressedBytes / 2 + 1024` values (proto_converters.cpp,
+// "compressed data can't encode more values than bytes/2"). That heuristic is
+// wrong for FFOR delta-of-delta: regular timestamps compress far below 2
+// bytes/value (1000 x 1s-spaced timestamps -> 40 bytes), so any point with
+// more than ~1024 well-compressible timestamps was silently TRUNCATED to
+// (bytes/2 + 1024) points — reported as full success (e.g. 300k points ->
+// 3380 stored). Keeping every compressed point at <= 1024 timestamps makes
+// the server's cap always >= the true count. Large writes are split into
+// consecutive chunks of the same measurement+tags, which the server treats
+// identically to one large point (append semantics).
+const MAX_COMPRESSED_TS_PER_POINT = 1024;
+
+// Split a WritePoint with more than MAX_COMPRESSED_TS_PER_POINT timestamps
+// into consecutive chunks, slicing every column-aligned field. Points whose
+// fields are not column-aligned (scalars or length-mismatched arrays) are
+// returned unchanged — normalizeWritePoint sends RAW timestamps for those
+// instead (see [S1] above), preserving the server's mismatch validation and
+// replication semantics.
+function chunkWritePoint(point: WritePoint): WritePoint[] {
+  const tsCount = point.timestamps.length;
+  if (tsCount <= MAX_COMPRESSED_TS_PER_POINT) return [point];
+
+  const sliceField = (val: WritePoint["fields"][string], lo: number, hi: number) => {
+    if (Array.isArray(val)) return val.slice(lo, hi) as typeof val;
+    const wf = val as WriteField;
+    const out: WriteField = {};
+    if (wf.doubleValues) out.doubleValues = wf.doubleValues.slice(lo, hi);
+    if (wf.boolValues) out.boolValues = wf.boolValues.slice(lo, hi);
+    if (wf.stringValues) out.stringValues = wf.stringValues.slice(lo, hi);
+    if (wf.int64Values) out.int64Values = wf.int64Values.slice(lo, hi);
+    return out;
+  };
+
+  // Only split when every field is a column of exactly tsCount values.
+  for (const val of Object.values(point.fields)) {
+    let len: number | undefined;
+    if (Array.isArray(val)) {
+      len = val.length;
+    } else if (typeof val === "object" && val !== null) {
+      const wf = val as WriteField;
+      const arr = wf.doubleValues ?? wf.boolValues ?? wf.stringValues ?? wf.int64Values;
+      len = arr?.length;
+    }
+    if (len !== tsCount) return [point];
+  }
+
+  const chunks: WritePoint[] = [];
+  for (let lo = 0; lo < tsCount; lo += MAX_COMPRESSED_TS_PER_POINT) {
+    const hi = Math.min(lo + MAX_COMPRESSED_TS_PER_POINT, tsCount);
+    const fields: WritePoint["fields"] = {};
+    for (const [k, v] of Object.entries(point.fields)) {
+      fields[k] = sliceField(v, lo, hi);
+    }
+    chunks.push({
+      measurement: point.measurement,
+      tags: point.tags,
+      fields,
+      timestamps: point.timestamps.slice(lo, hi),
+    });
+  }
+  return chunks;
+}
+
 function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
   const tsCount = point.timestamps.length;
   const protoFields: Record<string, ProtoWriteField> = {};
@@ -743,7 +806,9 @@ function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
 
   // Compressed timestamps replace the raw repeated field (server >= 1.0.7
   // prefers the compressed bytes; a single timestamp is smaller raw).
-  if (tsCount >= 2) {
+  // [S1] Points that could not be chunked to <= 1024 timestamps fall back to
+  // raw timestamps so the server's bytes/2+1024 decode cap cannot truncate.
+  if (tsCount >= 2 && tsCount <= MAX_COMPRESSED_TS_PER_POINT) {
     base.compressedTimestamps = compressTimestamps(point.timestamps);
   } else {
     // [C2] Preserve bigint timestamps exactly on the raw path (no Number()).

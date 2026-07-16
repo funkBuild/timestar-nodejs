@@ -393,25 +393,42 @@ async function benchmarkDerived(client: TimestarClient): Promise<{
   console.log(`\nRunning ${derivedQueries.length} derived queries x ${QUERY_ITERS} iterations...`);
 
   for (const dq of derivedQueries) {
-    // Warmup
+    // Warmup — a derived benchmark over zero usable results is meaningless,
+    // so verify the warmup actually returns data before timing anything.
+    let warmupPoints = 0;
     for (let i = 0; i < 5; i++) {
       try {
-        await client.derived(dq.queries, dq.formula, {
+        const wr = await client.derived(dq.queries, dq.formula, {
           startTime: BASE_TS, endTime: endTs, aggregationInterval: "5m",
         });
-      } catch { /* ignore warmup errors */ }
+        warmupPoints = wr.timestamps?.length ?? 0;
+      } catch (e) {
+        console.error(`  WARMUP FAILURE (${dq.name}):`, (e as Error).message);
+      }
+    }
+    if (warmupPoints === 0) {
+      console.error(`  SKIPPING ${dq.name}: warmup returned no data — latencies would be bogus`);
+      continue;
     }
 
     const lats: number[] = [];
+    let failures = 0;
     for (let i = 0; i < QUERY_ITERS; i++) {
       const t0 = performance.now();
       try {
-        await client.derived(dq.queries, dq.formula, {
+        const dr = await client.derived(dq.queries, dq.formula, {
           startTime: BASE_TS, endTime: endTs, aggregationInterval: "5m",
         });
-      } catch { /* skip errors */ }
-      lats.push(performance.now() - t0);
+        if ((dr.timestamps?.length ?? 0) === 0) failures++;
+        lats.push(performance.now() - t0);
+      } catch {
+        failures++;  // failed iterations are excluded from latency stats
+      }
     }
+    if (failures > 0) {
+      console.error(`  WARNING (${dq.name}): ${failures}/${QUERY_ITERS} iterations failed or returned no data`);
+    }
+    if (lats.length === 0) continue;
     results.push({ name: dq.name, latencies: lats, stats: stats(lats) });
   }
 

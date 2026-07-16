@@ -3,7 +3,7 @@
 // and precise:true bigint round-trips.
 
 import { describe, it, expect, beforeAll } from "vitest";
-import { makeClient, flushToTsm, uniquePrefix, findField, queryUntilSeries, BASE, S, avg } from "./helpers";
+import { makeClient, flushToTsm, uniquePrefix, findField, BASE, S, avg } from "./helpers";
 import type { WritePoint } from "../../src/types";
 
 const client = makeClient();
@@ -233,11 +233,10 @@ describe("mixed-type points and per-type placement stability", () => {
 
     const read = async () => {
       // Numeric fields: per-point via 1s buckets (stable across placements).
-      // String fields: raw no-interval passthrough — strings are dropped from
-      // interval queries entirely (see the SERVER BUG test below) and are
-      // exempt from the no-interval collapse, so this shape is stable.
-      const r = await queryUntilSeries(client, `latest:${m}(i,b)`, { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "1s" });
-      const rs = await queryUntilSeries(client, `latest:${m}(s)`, { startTime: BASE, endTime: BASE + 4 * S });
+      // String fields: raw no-interval passthrough — strings bypass
+      // aggregation on no-interval queries and pass through verbatim.
+      const r = await client.query(`latest:${m}(i,b)`, { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "1s" });
+      const rs = await client.query(`latest:${m}(s)`, { startTime: BASE, endTime: BASE + 4 * S });
       return {
         i: findField(r, "i").values,
         b: findField(r, "b").values,
@@ -255,22 +254,29 @@ describe("mixed-type points and per-type placement stability", () => {
     expect(tsm).toEqual(mem);
   });
 
-  // SERVER BUG: string fields are silently OMITTED from any query that has
-  // an aggregationInterval, even though they pass through untouched on
-  // no-interval queries (and `latest` + a whole-range 1h interval sometimes
-  // includes them — the inclusion rule is inconsistent).
-  // Repro: write {s: ["a","","c","d"], f:[1,2,3,4]}; query latest:m() with
-  // aggregationInterval "1s" -> only field f comes back, s vanishes.
-  it.fails("SERVER BUG: string fields are included in interval queries", async () => {
+  // String fields participate in interval queries as latest-per-bucket:
+  // each bucket reports the value with the greatest timestamp in the bucket,
+  // stamped with the epoch-aligned bucket start. (Strings were formerly
+  // silently omitted from any query with an aggregationInterval; fixed
+  // server-side.)
+  it("string fields in interval queries are latest-per-bucket at bucket-start timestamps", async () => {
     const m = `${P}.strdrop`;
     await client.write({
       measurement: m, tags: { t: "a" },
       fields: { s: ["a", "b", "c", "d"], f: [1, 2, 3, 4] },
       timestamps: [BASE, BASE + S, BASE + 2 * S, BASE + 3 * S],
     });
-    const r = await client.query(`latest:${m}()`, { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "1s" });
-    expect(findField(r, "f").values.length).toBeGreaterThan(0);
-    expect(r.series.some((x) => x.fields.s)).toBe(true); // s is dropped
+    // 2s buckets (BASE is a multiple of 2s): [BASE,+2s) holds "a"@+0s,"b"@+1s;
+    // [+2s,+4s) holds "c"@+2s,"d"@+3s. Latest-per-bucket keeps the greatest-ts
+    // value of each bucket, stamped with the bucket start.
+    const r = await client.query(`latest:${m}()`, { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "2s" });
+    const s = findField(r, "s");
+    expect(s.timestamps).toEqual([BASE, BASE + 2 * S]);
+    expect(s.values).toEqual(["b", "d"]);
+    // The numeric sibling field folds identically alongside.
+    const f = findField(r, "f");
+    expect(f.timestamps).toEqual([BASE, BASE + 2 * S]);
+    expect(f.values).toEqual([2, 4]);
   });
 });
 
@@ -326,13 +332,12 @@ describe("client compressed vs uncompressed write paths", () => {
   });
 });
 
-describe("large writes (client chunking workaround for server decode cap)", () => {
-  // SERVER BUG (worked around in the client, see [S1] in src/client.ts):
-  // the server caps compressed-timestamp decoding at bytes/2 + 1024 values,
-  // silently truncating any single point with > ~1024 well-compressed
-  // timestamps (e.g. 300k written -> 3380 stored, status "success").
-  // The client now splits large points into <= 1024-timestamp chunks; these
-  // tests prove the full round-trip.
+describe("large writes (client 1024-timestamp chunking)", () => {
+  // The client splits large points into <= 1024-timestamp chunks (see [S1]
+  // in src/client.ts) — kept for compatibility with servers older than
+  // commit 8425b17, whose compressed-timestamp decode cap silently truncated
+  // larger points (e.g. 300k written -> 3380 stored, status "success").
+  // Harmless on fixed servers; these tests prove the chunked full round-trip.
   it("5000-point single-series write stores every point with exact values", async () => {
     const m = `${P}.large`;
     const n = 5000;

@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import {
-  makeClient, flushToTsm, uniquePrefix, findField, bucketStart, queryUntilSeries,
+  makeClient, flushToTsm, uniquePrefix, findField, bucketStart,
   BASE, S, sum, avg, min, max, spread, median, stddev, stdvar,
 } from "./helpers";
 import type { QueryResponse } from "../../src/types";
@@ -55,9 +55,7 @@ async function queryAll(measurement: string): Promise<Map<string, QueryResponse>
     // One 1h bucket covers the whole 12s dataset (verified: bucket boundaries
     // are epoch-aligned multiples of the interval; BASE..BASE+11s crosses no
     // 3600s multiple because BASE mod 3600e9 = 800e9 and 800+11 < 3600).
-    // queryUntilSeries: masks the transient post-conversion invisibility
-    // window (see helpers.ts) for the tsm/spanning placements.
-    out.set(m, await queryUntilSeries(client, `${m}:${measurement}(v)`, {
+    out.set(m, await client.query(`${m}:${measurement}(v)`, {
       startTime: BASE,
       endTime: BASE + N * S,
       aggregationInterval: "1h",
@@ -176,9 +174,8 @@ describe("interval bucketing", () => {
   });
 
   it("misaligned startTime keeps epoch-aligned buckets but excludes points before startTime", async () => {
-    // A dense series is used because misaligned starts over sparse ranges
-    // (< ~20 in-range points) hit the single-bucket collapse bug pinned
-    // below. 60 points at 1s spacing, v = i.
+    // Dense variant: 60 points at 1s spacing, v = i. (The sparse variant of
+    // the same shape is covered by the small-window tests below.)
     const m = `${P}.misaligned`;
     const dTs = Array.from({ length: 60 }, (_, i) => BASE + i * S);
     const dV = Array.from({ length: 60 }, (_, i) => i);
@@ -239,23 +236,15 @@ describe("interval bucketing", () => {
     }
   });
 
-  // SERVER BUG (warmed server): interval queries collapse ALL points into a
-  // SINGLE bucket stamped with the first bucket start instead of returning
-  // epoch-aligned per-bucket results, when either
-  //   - startTime is not bucket-aligned and fewer than ~20 points are in
-  //     range (13 in-range points collapse, 20+ do not), or
-  //   - endTime - startTime <= 1 interval (even with aligned start).
-  // Repro A: 5 pts at +0/5/10/15/20s (v=10..50); avg 10s buckets over
-  //   [first+3s, first+21s] -> expect buckets [BASE,+10s,+20s]=[20,35,50],
-  //   actual: single bucket [BASE]=[35].
-  // Repro B (aligned start, 60-pt series): avg 10s buckets over
-  //   [first+3s, first+13s] -> expect [BASE]=6, [BASE+10s]=11.5(incl. end),
-  //   actual: single bucket [BASE]=8.
-  // Does NOT reproduce on a freshly-started server (first seconds after
-  // boot) — the collapse appears once the server has warmed up, which is
-  // itself a determinism problem.
-  it.fails("SERVER BUG: small-window interval queries collapse into a single bucket (misaligned start)", async () => {
+  // Small-window interval queries return epoch-aligned per-bucket results
+  // regardless of startTime alignment, in-range point count, or how many
+  // intervals the range spans. (These two shapes formerly collapsed into a
+  // single bucket on a warmed server; fixed server-side.)
+  it("misaligned start over few points still buckets per epoch-aligned interval", async () => {
     const m = `${P}.collapse1`;
+    // 5 pts at +0/5/10/15/20s, v = 10..50. Range [+3s, +21s] (endTime
+    // inclusive) keeps +5/+10/+15/+20s -> 10s buckets:
+    //   [BASE,+10s): {20}  [+10s,+20s): {30,40} -> 35  [+20s,+30s): {50}
     const ts5 = [BASE, BASE + 5 * S, BASE + 10 * S, BASE + 15 * S, BASE + 20 * S];
     await client.write({ measurement: m, tags: { t: "a" }, fields: { v: [10, 20, 30, 40, 50] }, timestamps: ts5 });
     const r = await client.query(`avg:${m}(v)`, { startTime: BASE + 3 * S, endTime: BASE + 21 * S, aggregationInterval: "10s" });
@@ -264,7 +253,7 @@ describe("interval bucketing", () => {
     expect(f.values).toEqual([20, 35, 50]);
   });
 
-  it.fails("SERVER BUG: small-window interval queries collapse into a single bucket (aligned start, range == interval)", async () => {
+  it("range spanning a single interval still buckets per epoch-aligned interval (aligned start)", async () => {
     const m = `${P}.collapse2`;
     await client.write({
       measurement: m, tags: { t: "a" },
@@ -274,21 +263,25 @@ describe("interval bucketing", () => {
     const r = await client.query(`avg:${m}(v)`, { startTime: BASE, endTime: BASE + S, aggregationInterval: "1s" });
     const f = findField(r, "v");
     expect(f.timestamps).toEqual([BASE, BASE + S]);
-    expect(f.values).toEqual([0, 1]); // actual: single bucket [0.5]
+    expect(f.values).toEqual([0, 1]);
   });
 
-  it("numeric nanosecond interval strings are rejected with a descriptive error (unit suffix required)", async () => {
-    // The JSON API documents numeric-ns aggregationInterval, but the protobuf
-    // API carries it as a string and the parser demands a unit suffix. Pinned.
-    await expect(
-      client.query(`avg:${M}(v)`, { startTime: BASE, endTime: BASE + 21 * S, aggregationInterval: "10000000000" }),
-    ).rejects.toMatchObject({ statusCode: 400, code: "INVALID_QUERY" });
+  it("numeric nanosecond interval strings are accepted and bucket like their unit-suffixed equivalent", async () => {
+    // "10000000000" (numeric ns, no unit suffix) == 10s. Same expectation as
+    // the epoch-aligned 10s bucketing above, restricted to [BASE, BASE+21s].
+    const r = await client.query(`avg:${M}(v)`, { startTime: BASE, endTime: BASE + 21 * S, aggregationInterval: "10000000000" });
+    const f = findField(r, "v");
+    const exp = expectedBuckets(10 * S, BASE, BASE + 21 * S);
+    expect(exp.ts).toEqual([BASE, BASE + 10 * S, BASE + 20 * S]);
+    expect(exp.values).toEqual([0.5, 2.5, 4]); // avg{0,1}, avg{2,3}, avg{4}
+    expect(f.timestamps).toEqual(exp.ts);
+    expect(f.values).toEqual(exp.values);
   });
 });
 
 describe("no-interval query semantics", () => {
-  // Without aggregationInterval and with startTime exactly at the first data
-  // point, a single-series query passes raw points through (pinned).
+  // Without aggregationInterval a single-series query passes raw points
+  // through, independent of startTime alignment and data placement.
   it("raw passthrough when startTime == first point [memory]", async () => {
     const M = `${P}.raw`;
     // Pre-flush: brings the shard WALs back to ~empty so this small write is
@@ -302,63 +295,63 @@ describe("no-interval query semantics", () => {
     expect(f.values).toEqual(D);
   });
 
-  // SERVER BUG: the shape of a no-interval query result depends on where the
-  // data lives and on range/data-extent alignment, instead of being a stable
-  // function of the query:
-  //   - memory store + startTime == first point  -> N raw points
-  //   - memory store + startTime <  first point  -> 1 collapsed aggregate
-  //   - TSM          + any startTime             -> 1 collapsed aggregate
-  // Repro: write [3,-7,...] (12 pts); avg:m(v) startTime=first-1s -> 1 value
-  // 9.375; same query with startTime=first -> 12 raw values. After flushing
-  // to TSM even startTime=first returns 1 collapsed value.
-  it.fails("SERVER BUG: no-interval result shape is independent of startTime alignment", async () => {
+  // No-interval queries are a stable function of the query: raw passthrough
+  // of every in-range point, independent of startTime alignment and of where
+  // the data lives (memstore vs TSM). (Formerly the shape depended on both;
+  // fixed server-side.)
+  it("no-interval result is raw passthrough regardless of startTime alignment", async () => {
     const M = `${P}.raw2`;
     await flushToTsm(client); // normalize WAL fill: keep this write in the memory store
     await client.write({ measurement: M, tags: { t: "a" }, fields: { v: D }, timestamps: TS });
     const exact = await client.query(`avg:${M}(v)`, { startTime: TS[0], endTime: TS[N - 1] + S });
     const before = await client.query(`avg:${M}(v)`, { startTime: TS[0] - S, endTime: TS[N - 1] + S });
     // Same data, same semantics — the extra empty second before the first
-    // point must not change the result shape.
-    expect(findField(before, "v").values.length).toBe(findField(exact, "v").values.length);
+    // point changes nothing: both return the 12 raw points verbatim.
+    for (const r of [exact, before]) {
+      const f = findField(r, "v");
+      expect(f.timestamps).toEqual(TS);
+      expect(f.values).toEqual(D);
+    }
   });
 
-  it.fails("SERVER BUG: no-interval result shape is independent of data placement (memstore vs TSM)", async () => {
+  it("no-interval result is raw passthrough regardless of data placement (memstore vs TSM)", async () => {
     const M = `${P}.raw3`;
     await flushToTsm(client); // normalize WAL fill: keep this write in the memory store
     await client.write({ measurement: M, tags: { t: "a" }, fields: { v: D }, timestamps: TS });
     const mem = await client.query(`avg:${M}(v)`, { startTime: TS[0], endTime: TS[N - 1] + S });
     await flushToTsm(client);
-    const tsm = await queryUntilSeries(client, `avg:${M}(v)`, { startTime: TS[0], endTime: TS[N - 1] + S });
-    // memstore: 12 raw points; TSM: 1 collapsed aggregate. Must be identical.
-    expect(findField(tsm, "v").values.length).toBe(findField(mem, "v").values.length);
+    const tsm = await client.query(`avg:${M}(v)`, { startTime: TS[0], endTime: TS[N - 1] + S });
+    // Both placements return the 12 raw points verbatim.
+    for (const r of [mem, tsm]) {
+      const f = findField(r, "v");
+      expect(f.timestamps).toEqual(TS);
+      expect(f.values).toEqual(D);
+    }
   });
 });
 
 describe("NaN handling x placement", () => {
-  // SERVER BUG: count/avg over a series containing NaN diverge between the
-  // memory-store fold (NaN excluded: count=2, avg=(1+3)/2=2) and the TSM
-  // block-stats fold (NaN counted: count=3, avg=4/3). sum/min/max agree.
-  // Repro: write v=[1,NaN,3]; count 1h-bucket -> memstore 2, after flush 3.
-  it.fails("SERVER BUG: count over [1,NaN,3] is placement-independent", async () => {
+  // NaN points are excluded from every aggregation fold, identically on the
+  // memory-store path and the TSM block-stats path. (count/avg formerly
+  // diverged: the TSM fold counted NaN — count=3, avg=4/3; fixed server-side.)
+  it("count over [1,NaN,3] excludes NaN on both placements (count = 2)", async () => {
     const M = `${P}.nan1`;
     await flushToTsm(client); // normalize WAL fill: keep this write in the memory store
     await client.write({ measurement: M, tags: { t: "a" }, fields: { v: [1, NaN, 3] }, timestamps: [BASE, BASE + S, BASE + 2 * S] });
-    const q = () => queryUntilSeries(client, `count:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" });
-    const mem = findField(await q(), "v").values[0];
+    const q = () => client.query(`count:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" });
+    expect(findField(await q(), "v").values).toEqual([2]); // memstore
     await flushToTsm(client);
-    const tsm = findField(await q(), "v").values[0];
-    expect(tsm).toBe(mem);
+    expect(findField(await q(), "v").values).toEqual([2]); // TSM
   });
 
-  it.fails("SERVER BUG: avg over [1,NaN,3] is placement-independent", async () => {
+  it("avg over [1,NaN,3] excludes NaN on both placements (avg = 2)", async () => {
     const M = `${P}.nan2`;
     await flushToTsm(client); // normalize WAL fill: keep this write in the memory store
     await client.write({ measurement: M, tags: { t: "a" }, fields: { v: [1, NaN, 3] }, timestamps: [BASE, BASE + S, BASE + 2 * S] });
-    const q = () => queryUntilSeries(client, `avg:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" });
-    const mem = findField(await q(), "v").values[0];
+    const q = () => client.query(`avg:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" });
+    expect(findField(await q(), "v").values).toEqual([(1 + 3) / 2]); // memstore
     await flushToTsm(client);
-    const tsm = findField(await q(), "v").values[0];
-    expect(tsm).toBe(mem); // memstore: 2 (NaN skipped), TSM: 1.333... (NaN counted)
+    expect(findField(await q(), "v").values).toEqual([(1 + 3) / 2]); // TSM
   });
 
   it("sum/min/max over [1,NaN,3] agree across placements (NaN skipped)", async () => {
@@ -366,7 +359,7 @@ describe("NaN handling x placement", () => {
     await flushToTsm(client); // normalize WAL fill: keep this write in the memory store
     await client.write({ measurement: M, tags: { t: "a" }, fields: { v: [1, NaN, 3] }, timestamps: [BASE, BASE + S, BASE + 2 * S] });
     const q = async (agg: string) =>
-      findField(await queryUntilSeries(client, `${agg}:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" }), "v").values[0];
+      findField(await client.query(`${agg}:${M}(v)`, { startTime: BASE, endTime: BASE + 3 * S, aggregationInterval: "1h" }), "v").values[0];
     const memVals = [await q("sum"), await q("min"), await q("max")];
     expect(memVals).toEqual([4, 1, 3]);
     await flushToTsm(client);

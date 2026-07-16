@@ -19,6 +19,14 @@ Communicates over a protobuf binary protocol and compresses all data in-process 
 
 **Requires TimeStar server >= 1.0.7** (`funkbuild/timestar:1.0.7`).
 
+Client 1.1.x is fully validated (the complete correctness suite in
+`test/correctness/`) against TimeStar server builds from commit `8425b17`
+(2026-07-17) or newer; compressed writes require server >= 1.0.7. The client
+still splits large compressed writes into <= 1024-timestamp chunks — a
+workaround for a compressed-timestamp truncation bug in servers older than
+`8425b17` that is kept for old-server compatibility and is harmless on fixed
+servers (consecutive chunks append identically to one large point).
+
 Since client 1.1.0, compressed write payloads are sent **instead of** the raw
 arrays. Servers older than 1.0.7 ignored the `compressed_*` protobuf fields
 entirely, so compressed writes against them return success while **silently

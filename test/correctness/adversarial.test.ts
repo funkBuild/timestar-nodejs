@@ -134,25 +134,25 @@ describe("measurement and tag name edge cases", () => {
     expect(findField(r, "v").values).toEqual([7]);
   });
 
-  // SERVER BUG: the FIRST write of a measurement name longer than 10000
-  // chars fails with a raw 500 "Internal server error" (server log:
-  // "SeriesMetadata has suspiciously long strings") instead of a flat 4xx
-  // validation error; a RETRY of the same write then reports success, and
-  // the measurement never appears in /measurements. Repro: POST /write with
-  // a fresh 10001+-char measurement -> 500.
-  it.fails("SERVER BUG: measurement name over 10000 chars is rejected with a flat 4xx (not 500)", async () => {
+  // Over-limit measurement names are rejected with a flat 400 validation
+  // error on EVERY attempt, and the measurement never comes into existence.
+  // (Formerly the first attempt hit a raw 500 and a retry falsely reported
+  // success; fixed server-side.)
+  it("measurement name over 10000 chars is rejected with a flat 400 on every attempt and never listed", async () => {
     const name = `${P}_long_` + "m".repeat(10_100);
-    try {
-      await client.write({ measurement: name, tags: { t: "a" }, fields: { v: 1 }, timestamps: [BASE] });
-      // Either a clean partial/error response...
-      expect.unreachable("expected a validation error");
-    } catch (e) {
-      const err = e as TimestarError;
-      // ...or a thrown TimestarError with a 4xx status. The actual behavior
-      // is a 500, which fails this assertion.
-      expect(err.statusCode).toBeGreaterThanOrEqual(400);
-      expect(err.statusCode).toBeLessThan(500);
+    for (const attempt of [1, 2]) {
+      try {
+        await client.write({ measurement: name, tags: { t: "a" }, fields: { v: 1 }, timestamps: [BASE] });
+        expect.unreachable(`attempt ${attempt}: expected a validation error`);
+      } catch (e) {
+        expect(e, `attempt ${attempt}`).toBeInstanceOf(TimestarError);
+        const err = e as TimestarError;
+        expect(err.statusCode, `attempt ${attempt}`).toBe(400);
+        expect(err.message, `attempt ${attempt}`).toMatch(/Measurement name too long/);
+      }
     }
+    const list = await client.measurements({ prefix: `${P}_long_` });
+    expect(list.measurements).toEqual([]);
   });
 
   it("empty tag key -> partial with per-point error, nothing written", async () => {
@@ -257,14 +257,14 @@ describe("duplicate and concurrent writes", () => {
 });
 
 describe("protocol-level pins (raw codecs)", () => {
-  // SERVER BUG (CRITICAL, worked around in this client — see [S1] in
-  // src/client.ts): compressed_timestamps are decoded with an upper bound of
-  // bytes/2 + 1024 values (lib/http/proto_converters.cpp: "compressed data
-  // can't encode more values than bytes/2"). FFOR delta-of-delta encodes
-  // regular timestamps at ~0.03 bytes/value, so a single point with 2000
-  // 1s-spaced timestamps decodes to exactly 1052 points — and the write
-  // reports SUCCESS with no error. Silent data loss.
-  it.fails("SERVER BUG: a single point with 2000 compressed timestamps stores all 2000", async () => {
+  // A single point with 2000 well-compressed timestamps is stored in full.
+  // (The server formerly capped compressed-timestamp decoding at
+  // bytes/2 + 1024 values and silently truncated to 1052 points while
+  // reporting success; fixed server-side. The client's own write path also
+  // chunks at 1024 timestamps for compatibility with old servers — see [S1]
+  // in src/client.ts — so this test bypasses the client and sends one raw
+  // 2000-timestamp point through the proto codecs.)
+  it("a single point with 2000 compressed timestamps stores all 2000", async () => {
     await protoInit();
     const m = `${P}.trunc`;
     const n = 2000;
@@ -283,19 +283,26 @@ describe("protocol-level pins (raw codecs)", () => {
       body,
     });
     const wr = await codecs.WriteResponse.decode(new Uint8Array(await res.arrayBuffer()));
-    // Actual: status "partial" with "Field 'v' has 2000 values but 1052
-    // timestamps" (raw values path) — or silent truncation to 1052 when the
-    // values are compressed too.
     expect(wr.status).toBe("success");
     expect(wr.pointsWritten).toBe(n);
+
+    // Full storage: every point is counted, and values well beyond the old
+    // 1052-point truncation boundary read back exactly (v[i] = i * 0.5).
+    const c = await client.query(`count:${m}(v)`, { startTime: BASE, endTime: BASE + n * S, aggregationInterval: "1d" });
+    const cf = findField(c, "v");
+    expect((cf.values as number[]).reduce((a, b) => a + b, 0)).toBe(n);
+    const spot = await client.query(`avg:${m}(v)`, { startTime: ts[1500], endTime: ts[1503] });
+    const f = findField(spot, "v");
+    expect(f.timestamps).toEqual(ts.slice(1500, 1504)); // endTime inclusive
+    expect(f.values).toEqual([750, 750.5, 751, 751.5]);
   });
 
-  // SERVER BUG: a bare protobuf DeleteRequest that uses the STRUCTURED form
-  // (measurement/tags/fields, no series key) parses as a VALID-BUT-EMPTY
-  // BatchDeleteRequest (its fields are unknown-field-skipped), so the server
-  // executes zero deletes and reports success with totalRequests=0. The
-  // client works around this by always sending BatchDeleteRequest.
-  it.fails("SERVER BUG: bare structured protobuf DeleteRequest deletes the series", async () => {
+  // A bare protobuf DeleteRequest in the STRUCTURED form (measurement/tags/
+  // fields, no series key) executes the delete. (It formerly parsed as a
+  // valid-but-empty BatchDeleteRequest and was silently ignored with
+  // totalRequests=0; fixed server-side. The client always sends
+  // BatchDeleteRequest, so this exercises the raw single-request wire form.)
+  it("bare structured protobuf DeleteRequest deletes the series", async () => {
     await protoInit();
     const m = `${P}.baredelete`;
     await client.write({ measurement: m, tags: { t: "a" }, fields: { v: [1, 2] }, timestamps: [BASE, BASE + S] });
@@ -307,35 +314,37 @@ describe("protocol-level pins (raw codecs)", () => {
     });
     expect(res.status).toBe(200);
     const dr = await codecs.DeleteResponse.decode(new Uint8Array(await res.arrayBuffer()));
-    expect(dr.totalRequests).toBe(1); // actual: 0 — request silently ignored
+    expect(dr.totalRequests).toBe(1);
     expect(dr.deletedCount).toBe(1);
+    // And the series is actually gone.
+    const after = await client.query(`avg:${m}(v)`, { startTime: BASE, endTime: BASE + 2 * S });
+    expect(after.series).toEqual([]);
   });
 
-  // SERVER BUG: a write whose WAL entry exceeds the configured WAL size
-  // threshold is rejected with HTTP 500 (message: "Insert batch too large
-  // ... exceeds WAL limit") instead of a 4xx with a flat error body. Only
-  // meaningful to pin when the threshold is small enough to reach in a test
-  // (the dedicated correctness server runs with a 2 MiB threshold; against
-  // a default 16 MiB server this test is skipped).
-  it.fails.skipIf(WAL_THRESHOLD > 8 * 1024 * 1024)(
-    "SERVER BUG: oversized write batch is rejected with 4xx, not 500",
+  // A write whose WAL entry exceeds the configured WAL size threshold is
+  // rejected with a flat HTTP 413 Payload Too Large. (Formerly a raw 500;
+  // fixed server-side.) Only meaningful when the threshold is small enough
+  // to reach in a test (the dedicated correctness server runs with a 2 MiB
+  // threshold; against a default 16 MiB server this test is skipped).
+  it.skipIf(WAL_THRESHOLD > 8 * 1024 * 1024)(
+    "oversized write batch is rejected with a flat 413",
     async () => {
       const m = `${P}.oversize`;
       // Random doubles ~8.2 WAL bytes/pt; 1.5x the threshold guarantees the
       // single-series (single-shard) entry exceeds the limit.
       const n = Math.ceil((WAL_THRESHOLD * 1.5) / 8);
-      const w = client.write({
-        measurement: m, tags: { t: "a" },
-        fields: { v: Array.from({ length: n }, () => Math.random() * 1e9) },
-        timestamps: Array.from({ length: n }, (_, i) => BASE + i * S),
-      });
       try {
-        await w;
-        // Success would also be acceptable server behavior (auto-split).
+        await client.write({
+          measurement: m, tags: { t: "a" },
+          fields: { v: Array.from({ length: n }, () => Math.random() * 1e9) },
+          timestamps: Array.from({ length: n }, (_, i) => BASE + i * S),
+        });
+        expect.unreachable("expected a 413 rejection");
       } catch (e) {
+        expect(e).toBeInstanceOf(TimestarError);
         const err = e as TimestarError;
-        expect(err.statusCode).toBeGreaterThanOrEqual(400);
-        expect(err.statusCode).toBeLessThan(500); // actual: 500
+        expect(err.statusCode).toBe(413);
+        expect(err.message).toMatch(/batch too large/i);
       }
     },
   );

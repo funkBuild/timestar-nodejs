@@ -725,17 +725,20 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
 
 // [S1] Maximum timestamps per point on the COMPRESSED-timestamp wire path.
 //
-// SERVER BUG WORKAROUND: the server decodes compressed_timestamps with an
-// upper bound of `compressedBytes / 2 + 1024` values (proto_converters.cpp,
-// "compressed data can't encode more values than bytes/2"). That heuristic is
-// wrong for FFOR delta-of-delta: regular timestamps compress far below 2
-// bytes/value (1000 x 1s-spaced timestamps -> 40 bytes), so any point with
-// more than ~1024 well-compressible timestamps was silently TRUNCATED to
-// (bytes/2 + 1024) points — reported as full success (e.g. 300k points ->
-// 3380 stored). Keeping every compressed point at <= 1024 timestamps makes
-// the server's cap always >= the true count. Large writes are split into
-// consecutive chunks of the same measurement+tags, which the server treats
-// identically to one large point (append semantics).
+// OLD-SERVER COMPAT: servers before commit 8425b17 (2026-07-17) decoded
+// compressed_timestamps with an upper bound of `compressedBytes / 2 + 1024`
+// values (proto_converters.cpp, "compressed data can't encode more values
+// than bytes/2"). That heuristic is wrong for FFOR delta-of-delta: regular
+// timestamps compress far below 2 bytes/value (1000 x 1s-spaced timestamps
+// -> 40 bytes), so any point with more than ~1024 well-compressible
+// timestamps was silently TRUNCATED to (bytes/2 + 1024) points — reported as
+// full success (e.g. 300k points -> 3380 stored). Current servers store
+// arbitrarily large compressed points in full, but the chunking is KEPT so
+// this client stays safe against older servers: keeping every compressed
+// point at <= 1024 timestamps makes the old cap always >= the true count,
+// and it is harmless on fixed servers — consecutive chunks of the same
+// measurement+tags are treated identically to one large point (append
+// semantics).
 const MAX_COMPRESSED_TS_PER_POINT = 1024;
 
 // Split a WritePoint with more than MAX_COMPRESSED_TS_PER_POINT timestamps
@@ -807,7 +810,7 @@ function normalizeWritePoint(point: WritePoint): ProtoWritePoint {
   // Compressed timestamps replace the raw repeated field (server >= 1.0.7
   // prefers the compressed bytes; a single timestamp is smaller raw).
   // [S1] Points that could not be chunked to <= 1024 timestamps fall back to
-  // raw timestamps so the server's bytes/2+1024 decode cap cannot truncate.
+  // raw timestamps so an old server's bytes/2+1024 decode cap cannot truncate.
   if (tsCount >= 2 && tsCount <= MAX_COMPRESSED_TS_PER_POINT) {
     base.compressedTimestamps = compressTimestamps(point.timestamps);
   } else {

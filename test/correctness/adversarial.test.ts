@@ -189,20 +189,31 @@ describe("measurement and tag name edge cases", () => {
 });
 
 describe("duplicate and concurrent writes", () => {
-  it("1000 duplicate points at the same timestamp append (count == 1000)", async () => {
+  it("duplicate points at the same timestamp overwrite — last write wins (count == 1)", async () => {
     const m = `${P}.dup`;
+    // 1000 writes to ONE timestamp in a single batch, values 1..1000.
+    // The write is accepted in full, but only the LAST value in request
+    // order survives (server-side last-write-wins dedup at ingest).
     const w = await client.write({
       measurement: m, tags: { t: "a" },
-      fields: { v: Array.from({ length: 1000 }, () => 5) },
+      fields: { v: Array.from({ length: 1000 }, (_, i) => i + 1) },
       timestamps: Array.from({ length: 1000 }, () => BASE),
     });
     expect(w.status).toBe("success");
     expect(w.pointsWritten).toBe(1000);
     const r = await client.query(`count:${m}(v)`, { startTime: BASE, endTime: BASE + S, aggregationInterval: "1h" });
-    expect(findField(r, "v").values).toEqual([1000]);
-    // And the aggregate over duplicates is exact: sum = 5000, avg = 5.
+    expect(findField(r, "v").values).toEqual([1]);
     const rs = await client.query(`sum:${m}(v)`, { startTime: BASE, endTime: BASE + S, aggregationInterval: "1h" });
-    expect(findField(rs, "v").values).toEqual([5000]);
+    expect(findField(rs, "v").values).toEqual([1000]);
+    // A later separate write to the same timestamp overwrites again.
+    const w2 = await client.write({
+      measurement: m, tags: { t: "a" }, fields: { v: [7] }, timestamps: [BASE],
+    });
+    expect(w2.status).toBe("success");
+    const r2 = await client.query(`latest:${m}(v)`, { startTime: BASE, endTime: BASE + S });
+    expect(findField(r2, "v").values).toEqual([7]);
+    const r3 = await client.query(`count:${m}(v)`, { startTime: BASE, endTime: BASE + S, aggregationInterval: "1h" });
+    expect(findField(r3, "v").values).toEqual([1]);
   });
 
   it("queries during heavy concurrent writes never fail and counts grow monotonically to the total", async () => {

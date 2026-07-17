@@ -737,8 +737,9 @@ function normalizeFieldValue(val: unknown, tsCount: number): ProtoWriteField | n
 // this client stays safe against older servers: keeping every compressed
 // point at <= 1024 timestamps makes the old cap always >= the true count,
 // and it is harmless on fixed servers — consecutive chunks of the same
-// measurement+tags are treated identically to one large point (append
-// semantics).
+// measurement+tags are treated identically to one large point (the server
+// preserves request order, so last-write-wins duplicate resolution is
+// unaffected by chunk boundaries).
 const MAX_COMPRESSED_TS_PER_POINT = 1024;
 
 // Split a WritePoint with more than MAX_COMPRESSED_TS_PER_POINT timestamps

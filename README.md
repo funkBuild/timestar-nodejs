@@ -20,12 +20,16 @@ Communicates over a protobuf binary protocol and compresses all data in-process 
 **Requires TimeStar server >= 1.0.7** (`funkbuild/timestar:1.0.7`).
 
 Client 1.1.x is fully validated (the complete correctness suite in
-`test/correctness/`) against TimeStar server builds from commit `8425b17`
-(2026-07-17) or newer; compressed writes require server >= 1.0.7. The client
+`test/correctness/`) against TimeStar server builds with last-write-wins
+duplicate semantics (commit `694b3b6`, 2026-07-17, or newer — see "Duplicate
+points overwrite" below; the duplicate-write test fails against older
+append-semantics servers). Compressed writes require server >= 1.0.7. The client
 still splits large compressed writes into <= 1024-timestamp chunks — a
 workaround for a compressed-timestamp truncation bug in servers older than
 `8425b17` that is kept for old-server compatibility and is harmless on fixed
-servers (consecutive chunks append identically to one large point).
+servers (consecutive chunks store identically to one large point — the
+server preserves request order, so last-write-wins resolution of duplicate
+timestamps is unaffected by the chunk boundaries).
 
 Since client 1.1.0, compressed write payloads are sent **instead of** the raw
 arrays. Servers older than 1.0.7 ignored the `compressed_*` protobuf fields
@@ -112,11 +116,15 @@ Write semantics worth knowing:
 
 - **`pointsWritten` counts field-points**: fields × timestamps per point. A
   point with 3 fields and 10 timestamps reports `pointsWritten: 30`.
-- **Duplicate points append**: writing an identical
-  measurement+tags+field+timestamp again APPENDS another value at that
-  timestamp — it is not last-write-wins. Queries will see both values (and
-  aggregations will include both). Deduplicate client-side if you need
-  overwrite semantics.
+- **Duplicate points overwrite — last write wins** (server commit `694b3b6`,
+  2026-07-17, or newer): writing an identical
+  measurement+tags+field+timestamp again REPLACES the earlier value
+  (InfluxDB-compatible). Queries only ever see the newest write — raw reads
+  return one point and aggregations count it once, wherever the copies live
+  (same batch: last in request order wins; memory store; across a flush;
+  across storage files; after compaction). Idempotent write retries are
+  always safe. Older servers appended duplicates instead; if you must target
+  one, deduplicate client-side.
 - **Partial failures**: invalid points/fields are skipped and reported in
   `WriteResponse.errors` with `status: "partial"` — the write is not rolled
   back.

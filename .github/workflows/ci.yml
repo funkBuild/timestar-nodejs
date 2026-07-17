@@ -32,8 +32,10 @@ jobs:
       - name: Type check
         run: npx tsc --noEmit
 
+      # No server in this job: the correctness suite (test/correctness/)
+      # requires a live TimeStar and runs in the integration-test job.
       - name: Run unit tests
-        run: npm test
+        run: npm test -- --exclude 'test/correctness/**'
 
   integration-test:
     runs-on: ubuntu-24.04
@@ -56,11 +58,20 @@ jobs:
       - name: Build TypeScript
         run: npm run build:ts
 
+      # Canonical correctness-suite setup (see test/correctness/helpers.ts):
+      # 2MB WAL threshold so flush/oversized-batch tests can trigger cheaply,
+      # and the data dir shared with the runner so flushes are VERIFIED by
+      # watching WAL files roll over (the image's WORKDIR is
+      # /var/lib/timestar, where shard_N directories are created).
       - name: Start TimeStar container
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/tsdata"
+          chmod 777 "$GITHUB_WORKSPACE/tsdata"
           docker run -d --name timestar \
             -p 8086:8086 \
             -e TIMESTAR_OVERPROVISIONED=true \
+            -e TIMESTAR_WAL_SIZE_THRESHOLD=2097152 \
+            -v "$GITHUB_WORKSPACE/tsdata:/var/lib/timestar" \
             funkbuild/timestar:latest \
             --smp 1 --memory 512M
 
@@ -83,6 +94,8 @@ jobs:
         env:
           TIMESTAR_HOST: localhost
           TIMESTAR_PORT: 8086
+          TIMESTAR_DATA_DIR: ${{ github.workspace }}/tsdata
+          TIMESTAR_WAL_THRESHOLD: "2097152"
 
       - name: TimeStar logs (on failure)
         if: failure()

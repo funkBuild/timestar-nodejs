@@ -144,11 +144,12 @@ describe("Compressed protobuf round-trip", () => {
     expect(count.timestamps).toEqual(timestamps);
     expect(count.values).toEqual(ints);
 
-    // Booleans: server >= 1.0.7 returns NUMERIC 0/1 on all query paths
+    // Booleans: non-numeric, so they round-trip as real true/false on every
+    // query path (they used to come back coerced to numeric 0/1).
     const active = findField(resp, "active");
     expect(active.timestamps).toEqual(timestamps);
-    expect(active.values).toEqual(bools.map((b) => (b ? 1 : 0)));
-    for (const v of active.values) expect(typeof v).toBe("number");
+    expect(active.values).toEqual(bools);
+    for (const v of active.values) expect(typeof v).toBe("boolean");
 
     // Strings: exact zstd round-trip
     const label = findField(resp, "label");

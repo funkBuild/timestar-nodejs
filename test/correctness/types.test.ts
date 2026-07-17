@@ -45,14 +45,17 @@ describe("float values", () => {
     expect(f.values).toEqual(vals);
   });
 
-  it("-0 is accepted and reads back as a zero (sign of zero is NOT preserved — pinned)", async () => {
+  it("-0 is accepted and reads back as a zero (sign of zero may or may not survive — pinned loosely)", async () => {
     const m = `${P}.f3`;
     const ts = [BASE, BASE + S];
     await client.write({ measurement: m, tags: { t: "a" }, fields: { v: [-0, 1] }, timestamps: ts });
     const f = await readRaw(m, ts[0], ts[1]);
-    // Server round-trip may normalize -0 to +0 depending on which read path
-    // served the query; both compare === 0. Pinned loosely on purpose.
-    expect(f.values[0]).toBe(0);
+    // Raw reads round-trip -0 bit-exactly (ALP raw-bit exceptions), but a
+    // query served through an aggregation-shaped path may normalize -0 to +0
+    // (IEEE addition) — the server documents both. Accept either zero.
+    // NOTE: .toBe uses Object.is, where Object.is(-0, 0) === false — the ===
+    // comparison below is what "either zero" actually requires.
+    expect(f.values[0] === 0).toBe(true);
     expect(f.values[1]).toBe(1);
   });
 

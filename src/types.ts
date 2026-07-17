@@ -77,9 +77,13 @@ export interface FieldData {
    */
   timestamps: Array<number | bigint>;
   /**
-   * Field values. Note: boolean fields are returned as NUMERIC 0/1 by
-   * server >= 1.0.7 (all query paths aggregate booleans numerically).
-   * The boolean[] member remains only for compatibility with older servers.
+   * Field values, returned in the type they were written in.
+   *
+   * Boolean fields are returned as boolean[] (`true`/`false`). They are
+   * non-numeric: the aggregation method named in the query is ignored for
+   * them, exactly as it is for strings — without an aggregationInterval they
+   * pass through raw, and with one they reduce to LATEST-per-bucket. (Servers
+   * before this behaviour coerced them to numeric 0/1 on the query path.)
    *
    * int64 fields are number[] by default (values beyond 2^53 are rounded)
    * and bigint[] with `precise: true`. The write side always preserves full

@@ -130,27 +130,29 @@ describe("int64 values", () => {
 });
 
 describe("boolean values", () => {
-  it("bool arrays read back as numeric 0/1 (server >= 1.0.7 semantics)", async () => {
+  it("bool arrays read back as booleans, never numeric 0/1", async () => {
     const m = `${P}.b1`;
     const vals = [true, false, true, true, false];
     const ts = vals.map((_, i) => BASE + i * S);
     await client.write({ measurement: m, tags: { t: "a" }, fields: { v: vals }, timestamps: ts });
     const f = await readRaw(m, ts[0], ts[ts.length - 1]);
-    expect(f.values).toEqual([1, 0, 1, 1, 0]);
-    for (const v of f.values) expect(typeof v).toBe("number");
+    expect(f.values).toEqual(vals);
+    for (const v of f.values) expect(typeof v).toBe("boolean");
   });
 
-  it("bool aggregations are numeric: avg = fraction true, sum = count true", async () => {
+  it("bool aggregations are ignored: every method reduces to LATEST-per-bucket", async () => {
+    // Booleans are non-numeric — the aggregation method named in the query is
+    // ignored, exactly as it is for strings. One 1h bucket spans the whole
+    // range, so every method returns that bucket's latest value.
     const m = `${P}.b2`;
-    const vals = [true, false, true, true]; // 3 of 4 true
+    const vals = [true, false, true, true];
     const ts = vals.map((_, i) => BASE + i * S);
     await client.write({ measurement: m, tags: { t: "a" }, fields: { v: vals }, timestamps: ts });
     const whole = { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "1h" as const };
-    expect(findField(await client.query(`avg:${m}(v)`, whole), "v").values).toEqual([3 / 4]);
-    expect(findField(await client.query(`sum:${m}(v)`, whole), "v").values).toEqual([3]);
-    expect(findField(await client.query(`count:${m}(v)`, whole), "v").values).toEqual([4]);
-    expect(findField(await client.query(`min:${m}(v)`, whole), "v").values).toEqual([0]);
-    expect(findField(await client.query(`max:${m}(v)`, whole), "v").values).toEqual([1]);
+    for (const method of ["avg", "sum", "count", "min", "max", "latest"]) {
+      const f = findField(await client.query(`${method}:${m}(v)`, whole), "v");
+      expect(f.values, `${method} of a boolean field`).toEqual([true]);
+    }
   });
 });
 
@@ -218,7 +220,7 @@ describe("mixed-type points and per-type placement stability", () => {
     const r = await client.query(`latest:${m}()`, { startTime: BASE, endTime: BASE + S });
     expect(findField(r, "f").values[0]).toBe(21.5);
     expect(findField(r, "i").values[0]).toBe(42);
-    expect(findField(r, "b").values[0]).toBe(1);
+    expect(findField(r, "b").values[0]).toBe(true); // non-numeric: written type kept
     expect(findField(r, "s").values[0]).toBe("note");
   });
 
@@ -236,6 +238,8 @@ describe("mixed-type points and per-type placement stability", () => {
 
     const read = async () => {
       // Numeric fields: per-point via 1s buckets (stable across placements).
+      // Boolean fields: non-numeric, so the 1s buckets reduce them to
+      // LATEST-per-bucket — one boolean per point here, in written type.
       // String fields: raw no-interval passthrough — strings bypass
       // aggregation on no-interval queries and pass through verbatim.
       const r = await client.query(`latest:${m}(i,b)`, { startTime: BASE, endTime: BASE + 4 * S, aggregationInterval: "1s" });
@@ -249,7 +253,7 @@ describe("mixed-type points and per-type placement stability", () => {
 
     const mem = await read();
     expect(mem.i).toEqual(ints.map(Number));
-    expect(mem.b).toEqual([1, 1, 0, 1]);
+    expect(mem.b).toEqual(bools);
     expect(mem.s).toEqual(strs);
 
     await flushToTsm(client);
@@ -330,6 +334,7 @@ describe("client compressed vs uncompressed write paths", () => {
       expect(b[k].values, `field ${k} values`).toEqual(a[k].values);
     }
     expect(a.f.values).toEqual(vals);
+    expect(a.b.values).toEqual(bools);
     expect(a.i.values).toEqual(ints.map(Number));
     expect(a.s.values).toEqual(strs);
   });

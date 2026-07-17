@@ -45,8 +45,10 @@ Other server 1.0.7 behaviors this client relies on / surfaces:
 - **Protobuf content-type**: protobuf responses carry
   `Content-Type: application/x-protobuf` (older servers said `application/json`).
   The client accepts both.
-- **Boolean query values are numeric `0`/`1`** on every query path (older
-  servers returned `true`/`false` on some paths).
+- **Boolean query values are real `true`/`false`** on every query path.
+  Booleans are non-numeric: the aggregation method named in the query is
+  ignored for them, exactly as it is for strings (older servers coerced them
+  to numeric `0`/`1`).
 - **Deterministic response shape**: multi-field queries always return one
   series per measurement+tags with fields consolidated, regardless of shard
   placement.
@@ -173,8 +175,11 @@ for (const series of result.series) {
 }
 ```
 
-Note: boolean fields come back as **numeric `0`/`1`** values (server >= 1.0.7
-aggregates booleans numerically on every query path).
+Note: boolean and string fields are **non-numeric** — they come back in the
+type they were written in (`true`/`false` for booleans), and the aggregation
+method named in the query is ignored for them. Without an
+`aggregationInterval` they pass through raw; with one they reduce to
+LATEST-per-bucket.
 
 ### 64-bit Precision
 

@@ -33,9 +33,13 @@ const EXPECT: Record<string, { value: number; exact: boolean; ts?: number }> = {
   max: { value: max(D), exact: true },
   sum: { value: sum(D), exact: false },
   count: { value: N, exact: true },
-  // latest/first report the actual point timestamp, not the bucket start (probed).
-  latest: { value: D[N - 1], exact: true, ts: TS[N - 1] },
-  first: { value: D[0], exact: true, ts: TS[0] },
+  // latest/first pick a specific point's VALUE, but every method's bucket is
+  // stamped with the epoch-aligned bucket start — these queries all pass an
+  // aggregationInterval. (They used to report the raw point timestamp: the
+  // server dropped a range-covering interval for latest/first to reach its
+  // sparse fast path, which leaked the plan into the answer.)
+  latest: { value: D[N - 1], exact: true },
+  first: { value: D[0], exact: true },
   median: { value: median(D), exact: false },
   stddev: { value: stddev(D), exact: false },
   stdvar: { value: stdvar(D), exact: false },

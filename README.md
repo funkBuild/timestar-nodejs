@@ -386,6 +386,49 @@ Note that per-point write failures do NOT throw: `/write` returns HTTP 200
 with `status: "partial"` and the per-point messages in
 `WriteResponse.errors` (see Write semantics above).
 
+### `QUERY_INCOMPLETE` is not "no data"
+
+`err.code === "QUERY_INCOMPLETE"` (HTTP 500) means the requested range **may
+hold data that could not be read** — a series or a storage block the server
+refused to return rather than answer partially. It is emphatically *not* an
+empty result.
+
+Treating it as "no data" is the one dangerous way to handle it, and it is an
+easy mistake because the failing shape looks like absence:
+
+```ts
+// WRONG — a read failure is silently reclassified as "this series is new"
+let existing;
+try {
+  existing = await client.query(`latest:${measurement}(${field}){}`, { startTime: 0, endTime: now });
+} catch {
+  existing = { series: [] };   // <-- swallows QUERY_INCOMPLETE
+}
+```
+
+```ts
+// RIGHT — absence and unreadability are different answers
+try {
+  const res = await client.query(`latest:${measurement}(${field}){}`, { startTime: 0, endTime: now });
+  const isNew = res.series.length === 0;      // genuinely empty
+} catch (err) {
+  if (err instanceof TimestarError && err.code === "QUERY_INCOMPLETE") {
+    throw err;   // unknown, not empty — do not infer anything about the series
+  }
+  throw err;
+}
+```
+
+**Do not retry it blindly.** Unlike a timeout, this failure is deterministic:
+it repeats until the underlying file is repaired or compacted away. The client
+performs no automatic retries, so a retry loop is something you would be adding
+yourself — bound it, and surface the failure rather than spinning.
+
+Servers older than the decode-count-contract change behaved differently on
+corrupt storage: they returned **HTTP 200 with fewer points than were written**.
+If you have logic that depends on that quiet truncation, it was relying on
+silently wrong data.
+
 ## License
 
 MIT

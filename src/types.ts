@@ -380,4 +380,12 @@ export interface TimestarClientOptions {
    * bigint[] (exact 64-bit) instead of number[] (rounded beyond 2^53).
    */
   precise?: boolean;
+  /**
+   * Total time budget (milliseconds) for transparent write retries when the
+   * server responds 503 (congestion). Each retry waits the server's
+   * Retry-After header (falling back to exponential backoff when absent);
+   * once the accumulated wait would exceed this budget the 503 is thrown.
+   * Set to 0 to disable retries. Default: 30000.
+   */
+  maxRetryDelayMs?: number;
 }

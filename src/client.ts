@@ -61,6 +61,7 @@ export class TimestarClient {
   private readonly authToken?: string;
   private readonly requestTimeoutMs: number;
   private readonly precise: boolean;
+  private readonly maxRetryDelayMs: number;
   private initPromise: Promise<void> | null = null;
 
   constructor(options: TimestarClientOptions = {}) {
@@ -70,6 +71,7 @@ export class TimestarClient {
     this.authToken = options.authToken;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.precise = options.precise ?? false;
+    this.maxRetryDelayMs = options.maxRetryDelayMs ?? 30_000;
   }
 
   // Race-safe init: caches the Promise so concurrent callers share one init.
@@ -253,16 +255,44 @@ export class TimestarClient {
   // Write
   // ---------------------------------------------------------------------------
 
+  // On congestion the server responds 503 with a Retry-After header. Writes
+  // retry transparently: each attempt waits the server-requested delay
+  // (exponential backoff when the header is missing) until the accumulated
+  // wait would exceed maxRetryDelayMs, at which point the 503 is thrown.
   async write(points: WritePoint | WritePoint[]): Promise<WriteResponse> {
     const arr = Array.isArray(points) ? points : [points];
     const protoPoints = arr.flatMap(chunkWritePoint).map(normalizeWritePoint);
 
-    return this.protoPost<{ writes: ProtoWritePoint[] }, WriteResponse>(
-      "/write",
-      "WriteRequest",
-      "WriteResponse",
-      { writes: protoPoints },
-    );
+    { const p = this.ensureInit(); if (p) await p; }
+    const encoded = await codecs.WriteRequest.encode({ writes: protoPoints });
+
+    let waitedMs = 0;
+    for (let attempt = 0; ; attempt++) {
+      const res = await this.request(
+        "POST",
+        "/write",
+        encoded,
+        "application/protobuf",
+        "application/protobuf",
+      );
+
+      if (res.status === 503) {
+        const delay =
+          parseRetryAfterMs(res.headers["retry-after"]) ??
+          Math.min(RETRY_BACKOFF_BASE_MS * 2 ** attempt, RETRY_BACKOFF_CAP_MS);
+        if (waitedMs + delay > this.maxRetryDelayMs) {
+          await this.throwServerError(res, "WriteResponse");
+        }
+        await sleep(delay);
+        waitedMs += delay;
+        continue;
+      }
+
+      if (res.status >= 400) {
+        await this.throwServerError(res, "WriteResponse");
+      }
+      return codecs.WriteResponse.decode(res.body);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -606,6 +636,29 @@ export class TimestarClient {
     const proto = await codecs.ForecastResponse.decode(res.body);
     return convertForecastResponse(proto);
   }
+}
+
+// =============================================================================
+// Write retry helpers
+// =============================================================================
+
+// Backoff schedule used when a 503 arrives without a Retry-After header:
+// 500ms doubling per attempt, capped at 8s per wait.
+const RETRY_BACKOFF_BASE_MS = 500;
+const RETRY_BACKOFF_CAP_MS = 8_000;
+
+// Retry-After per RFC 9110: either delta-seconds or an HTTP-date.
+function parseRetryAfterMs(header: string | undefined): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const date = Date.parse(trimmed);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // =============================================================================

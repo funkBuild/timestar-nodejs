@@ -357,6 +357,21 @@ The `TimestarClient` constructor accepts a `TimestarClientOptions` object:
 | `useProtobuf` | `boolean` | `true` | Deprecated — the client always uses protobuf; this option is ignored. |
 | `requestTimeoutMs` | `number` | `30000` | Per-request timeout in milliseconds |
 | `precise` | `boolean` | `false` | Default for `QueryOptions.precise`: return timestamps and int64 field values as exact `bigint[]` instead of `number[]` (which rounds beyond 2^53). See "64-bit Precision". |
+| `maxRetryDelayMs` | `number` | `30000` | Total time budget for transparent write retries on server congestion (HTTP 503). Set to `0` to disable retries. See "Congestion backoff". |
+
+### Congestion backoff
+
+Under congestion the server responds to `/write` with **HTTP 503** and a
+`Retry-After` header. The client handles this transparently: `write()` waits
+the server-requested delay (both delta-seconds and HTTP-date forms are
+understood) and retries. If a 503 arrives without a `Retry-After` header, the
+client falls back to exponential backoff (500ms doubling per attempt, capped
+at 8s per wait).
+
+Retries stop once the accumulated wait would exceed `maxRetryDelayMs`
+(default 30 seconds) — at that point the 503 is thrown as a `TimestarError`
+with `statusCode: 503`. Only `write()` retries; all other endpoints surface
+the 503 immediately.
 
 ## Error Handling
 

@@ -70,13 +70,14 @@ describe("write retry on 503 congestion", () => {
   });
 
   it("honors an HTTP-date Retry-After", async () => {
-    const retryAt = new Date(Date.now() + 1000).toUTCString();
+    // HTTP-dates have 1s resolution (toUTCString truncates milliseconds), so
+    // a +2s date parses to a delay anywhere in (1s, 2s] — assert >= ~1s.
+    const retryAt = new Date(Date.now() + 2000).toUTCString();
     queue = [{ status: 503, headers: { "Retry-After": retryAt } }];
     const resp = await makeClient().write(POINT);
     expect(resp.status).toBe("success");
     expect(requestTimes.length).toBe(2);
-    // HTTP-dates have 1s resolution, so the parsed delay may round down.
-    expect(requestTimes[1] - requestTimes[0]).toBeGreaterThanOrEqual(400);
+    expect(requestTimes[1] - requestTimes[0]).toBeGreaterThanOrEqual(900);
   });
 
   it("falls back to exponential backoff when Retry-After is missing", async () => {

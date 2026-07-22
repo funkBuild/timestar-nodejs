@@ -33,6 +33,13 @@ export const S = 1_000_000_000; // 1s in ns
 
 export function makeClient(opts: { precise?: boolean; requestTimeoutMs?: number } = {}): TimestarClient {
   return new TimestarClient({
+    // These suites pin the SERVER'S canonical semantics: epoch-aligned
+    // buckets, booleans non-numeric.  The client library itself defaults to
+    // bucketAlignment "start" (rollup.js compat) — opt back out here so every
+    // canonical expectation below stays valid.  The client-side "start"
+    // default is pinned separately in test/query_compat.test.ts and the
+    // rollup-compat cases in test/integration.test.ts.
+    bucketAlignment: "epoch",
     host: HOST,
     port: PORT,
     requestTimeoutMs: opts.requestTimeoutMs ?? 25_000,

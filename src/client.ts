@@ -62,6 +62,8 @@ export class TimestarClient {
   private readonly requestTimeoutMs: number;
   private readonly precise: boolean;
   private readonly maxRetryDelayMs: number;
+  private readonly bucketAlignment: "epoch" | "start";
+  private readonly booleansAsNumeric: boolean;
   private initPromise: Promise<void> | null = null;
 
   constructor(options: TimestarClientOptions = {}) {
@@ -72,6 +74,11 @@ export class TimestarClient {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.precise = options.precise ?? false;
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? 30_000;
+    // This client exists to replace a rollup.js reader, so its buckets are
+    // start-aligned unless the caller opts back into the server's canonical
+    // epoch grid (see QueryOptions.bucketAlignment for the asymmetry note).
+    this.bucketAlignment = options.bucketAlignment ?? "start";
+    this.booleansAsNumeric = options.booleansAsNumeric ?? false;
   }
 
   // Race-safe init: caches the Promise so concurrent callers share one init.
@@ -304,6 +311,10 @@ export class TimestarClient {
     if (options.startTime !== undefined) payload.startTime = timeToWire(options.startTime);
     if (options.endTime !== undefined) payload.endTime = timeToWire(options.endTime);
     if (options.aggregationInterval !== undefined) payload.aggregationInterval = options.aggregationInterval;
+    // Always sent: "start" is this client's default (rollup.js-compatible),
+    // "epoch" restores the server default. Servers < 1.3.0 ignore the field.
+    payload.bucketAlignment = options.bucketAlignment ?? this.bucketAlignment;
+    if (options.booleansAsNumeric ?? this.booleansAsNumeric) payload.booleansAsNumeric = true;
 
     { const p = this.ensureInit(); if (p) await p; }
     const encoded = await codecs.QueryRequest.encode(payload);

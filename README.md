@@ -179,7 +179,34 @@ Note: boolean and string fields are **non-numeric** — they come back in the
 type they were written in (`true`/`false` for booleans), and the aggregation
 method named in the query is ignored for them. Without an
 `aggregationInterval` they pass through raw; with one they reduce to
-LATEST-per-bucket.
+LATEST-per-bucket. Pass `booleansAsNumeric: true` (per query or client-wide)
+to instead aggregate booleans arithmetically as `1.0`/`0.0` — `avg` of
+`[t,t,f,t,f]` is `0.6` — matching rollup.js. Requires server >= 1.3.0.
+
+### Bucket Alignment
+
+**This client defaults to `bucketAlignment: "start"`** for interval queries:
+buckets are anchored at `startTime` (rollup.js semantics), so a query starting
+3s past a 10s boundary gets buckets labelled `start, start+10s, ...`. The
+server's canonical default is the **epoch-aligned** grid
+(`floor(ts/interval)*interval`), whose boundaries never shift with the query
+range — opt back into it per query or client-wide:
+
+```ts
+// Per query
+await client.query("avg:cpu(usage){}", {
+  startTime, endTime,
+  aggregationInterval: "10s",
+  bucketAlignment: "epoch",
+});
+
+// Client-wide
+const client = new TimestarClient({ bucketAlignment: "epoch" });
+```
+
+Requires server >= 1.3.0 for `"start"`; older servers ignore the field and
+always answer epoch-aligned. Neither option has any effect without an
+`aggregationInterval`.
 
 ### 64-bit Precision
 

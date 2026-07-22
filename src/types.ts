@@ -54,6 +54,30 @@ export interface QueryOptions {
   endTime?: number | bigint;
   aggregationInterval?: string;
   /**
+   * Bucket-grid alignment for interval queries.
+   *
+   * "start" (THIS CLIENT'S DEFAULT): buckets are anchored at startTime —
+   * bucket = startTime + floor((ts − startTime)/interval)·interval — matching
+   * rollup.js semantics. "epoch": the server's canonical epoch-aligned grid
+   * (bucket = floor(ts/interval)·interval), whose boundaries never shift with
+   * the query range.
+   *
+   * NOTE the asymmetry: the SERVER defaults to "epoch"; this client sends
+   * "start" unless told otherwise (it exists to replace a rollup.js reader).
+   * Pass "epoch" here — or set the client-level option — to get the server's
+   * canonical grid. Requires server >= 1.3.0; older servers ignore the field
+   * and answer epoch-aligned. No effect without an aggregationInterval.
+   */
+  bucketAlignment?: "epoch" | "start";
+  /**
+   * When true, boolean fields aggregate arithmetically as 1.0/0.0 (avg of
+   * [t,t,f,t,f] is 0.6, matching rollup.js) and come back as number[] —
+   * raw reads included. Default false: booleans are non-numeric (see
+   * FieldData.values). Strings are unaffected either way. Requires
+   * server >= 1.3.0.
+   */
+  booleansAsNumeric?: boolean;
+  /**
    * Precision of decoded timestamps and int64 field values.
    *
    * Default (false): FieldData.timestamps and int64 values are returned as
@@ -388,4 +412,15 @@ export interface TimestarClientOptions {
    * Set to 0 to disable retries. Default: 30000.
    */
   maxRetryDelayMs?: number;
+  /**
+   * Default for QueryOptions.bucketAlignment on all queries from this client.
+   * Default "start" (rollup.js-compatible buckets anchored at startTime) —
+   * NOT the server's canonical "epoch" grid; see QueryOptions.bucketAlignment.
+   */
+  bucketAlignment?: "epoch" | "start";
+  /**
+   * Default for QueryOptions.booleansAsNumeric on all queries from this
+   * client. Default false.
+   */
+  booleansAsNumeric?: boolean;
 }

@@ -512,3 +512,79 @@ describe("Compression ratio benchmark", () => {
     console.log(`  Wrote ${resp.pointsWritten} points with compressed proto`);
   });
 });
+
+// ============================================================================
+// rollup.js compat: start-aligned buckets + numeric booleans (server >= 1.3.0)
+// ============================================================================
+
+describe("rollup compat options", () => {
+  it("start-aligned buckets anchor at startTime by default; epoch on request", async () => {
+    if (requireServer()) return;
+    const measurement = `${PREFIX}.rollup_align`;
+    // 40 points, 1s apart, value == index, base aligned to a 10s boundary.
+    const base = 1753056000000000000; // epoch-aligned for 10s buckets
+    const resp = await client.write({
+      measurement,
+      tags: { d: "a" },
+      fields: { v: Array.from({ length: 40 }, (_, i) => i) },
+      timestamps: Array.from({ length: 40 }, (_, i) => base + i * 1e9),
+      fieldTypes: { v: "float" },
+    });
+    expect(resp.status).toBe("success");
+
+    const startTime = base + 3e9; // 3s off the epoch grid — the divergence case
+    const endTime = base + 36.999e9;
+
+    // Client default: start-aligned — rollup.js labels and membership.
+    const aligned = await client.query(`avg:${measurement}(v){}`, {
+      startTime,
+      endTime,
+      aggregationInterval: "10s",
+    });
+    const alignedField = aligned.series[0].fields["v"];
+    expect(alignedField.timestamps.map(Number)).toEqual([
+      base + 3e9,
+      base + 13e9,
+      base + 23e9,
+      base + 33e9,
+    ]);
+    expect(alignedField.values).toEqual([7.5, 17.5, 27.5, 34.5]);
+
+    // Explicit epoch: the server's canonical grid.
+    const epoch = await client.query(`avg:${measurement}(v){}`, {
+      startTime,
+      endTime,
+      aggregationInterval: "10s",
+      bucketAlignment: "epoch",
+    });
+    const epochField = epoch.series[0].fields["v"];
+    expect(epochField.timestamps.map(Number)).toEqual([base, base + 10e9, base + 20e9, base + 30e9]);
+    expect(epochField.values).toEqual([6, 14.5, 24.5, 33]);
+  });
+
+  it("booleansAsNumeric aggregates [t,t,f,t,f] to 0.6", async () => {
+    if (requireServer()) return;
+    const measurement = `${PREFIX}.rollup_bool`;
+    const base = 1753056000000000000;
+    const resp = await client.write({
+      measurement,
+      tags: { d: "a" },
+      fields: { on: [true, true, false, true, false] },
+      timestamps: Array.from({ length: 5 }, (_, i) => base + i * 1e9),
+    });
+    expect(resp.status).toBe("success");
+
+    const opts = { startTime: base, endTime: base + 9.999e9, aggregationInterval: "10s" };
+
+    // Default: canonical non-numeric booleans — LATEST-per-bucket, boolean type.
+    const canonical = await client.query(`avg:${measurement}(on){}`, opts);
+    expect(canonical.series[0].fields["on"].values).toEqual([false]);
+
+    // Opt-in: numeric rollup, matching rollup.js.
+    const numeric = await client.query(`avg:${measurement}(on){}`, {
+      ...opts,
+      booleansAsNumeric: true,
+    });
+    expect(numeric.series[0].fields["on"].values).toEqual([0.6]);
+  });
+});

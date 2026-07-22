@@ -91,6 +91,8 @@ export interface ProtoQueryRequest {
   startTime?: number | string;
   endTime?: number | string;
   aggregationInterval?: string;
+  bucketAlignment?: string;
+  booleansAsNumeric?: boolean;
 }
 
 export interface ProtoFieldData {
